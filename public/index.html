@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LaTeX Editor</title>
+
+<!-- CodeMirror 5 for the source editor -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/eclipse.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
+
+<!-- PDF.js for rendering the compiled PDF -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header>
+  <h1>LaTeX Editor <span class="tag">Single-User(for now)</span></h1>
+  <div class="header-actions">
+    <span id="tectonic-status" class="status-pill status-unknown">checking tectonic…</span>
+    <button id="compile-btn">Compile</button>
+  </div>
+</header>
+
+<main>
+  <section id="editor-pane">
+    <textarea id="source"></textarea>
+  </section>
+
+  <section id="preview-pane">
+    <div id="preview-toolbar">
+      <span id="compile-state"></span>
+    </div>
+    <div id="pdf-container">
+      <p id="pdf-placeholder">Click "Compile" to render a preview.</p>
+    </div>
+    <div id="log-panel" class="hidden">
+      <div id="log-panel-header">
+        <strong>Compile log</strong>
+        <button id="log-close">×</button>
+      </div>
+      <pre id="log-content"></pre>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
