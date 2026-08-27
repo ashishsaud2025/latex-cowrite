@@ -22,10 +22,100 @@ const logPanel = document.getElementById('log-panel');
 const logContent = document.getElementById('log-content');
 const logClose = document.getElementById('log-close');
 const statusPill = document.getElementById('tectonic-status');
+const editorPane = document.getElementById('editor-pane');
+const previewPane = document.getElementById('preview-pane');
+const treeSidebar = document.getElementById('tree-sidebar');
+const treeResizer = document.getElementById('tree-resizer');
+const paneResizer = document.getElementById('pane-resizer');
+const logResizer = document.getElementById('log-resizer');
 
-// ---------------------------------------------------------------------------
+function loadWorkspaceSize(name, fallback) {
+  const value = Number(localStorage.getItem(`longtex-${name}`));
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function saveWorkspaceSize(name, value) {
+  localStorage.setItem(`longtex-${name}`, String(Math.round(value)));
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function setupResizeHandle(handle, direction, getBounds, applySize, storageName, initialSize) {
+  const setSize = (size, persist = false) => {
+    const bounds = getBounds();
+    const nextSize = clamp(size, bounds.min, bounds.max);
+    applySize(nextSize);
+    handle.setAttribute('aria-valuenow', Math.round(nextSize));
+    if (persist) saveWorkspaceSize(storageName, nextSize);
+  };
+
+  setSize(loadWorkspaceSize(storageName, initialSize));
+  handle.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    const startPosition = direction === 'x' ? event.clientX : event.clientY;
+    const startSize = direction === 'x'
+      ? handle.previousElementSibling.getBoundingClientRect().width
+      : handle.parentElement.getBoundingClientRect().height;
+    handle.setPointerCapture(event.pointerId);
+    document.body.classList.add('is-resizing');
+
+    const move = (moveEvent) => {
+      const position = direction === 'x' ? moveEvent.clientX : moveEvent.clientY;
+      setSize(startSize + position - startPosition);
+    };
+    const stop = () => {
+      const size = direction === 'x'
+        ? handle.previousElementSibling.getBoundingClientRect().width
+        : handle.parentElement.getBoundingClientRect().height;
+      setSize(size, true);
+      document.body.classList.remove('is-resizing');
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', stop);
+      handle.removeEventListener('pointercancel', stop);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', stop);
+    handle.addEventListener('pointercancel', stop);
+  });
+
+  handle.addEventListener('keydown', (event) => {
+    const increment = event.shiftKey ? 50 : 10;
+    const change = ['ArrowRight', 'ArrowDown'].includes(event.key) ? increment
+      : ['ArrowLeft', 'ArrowUp'].includes(event.key) ? -increment : 0;
+    if (!change) return;
+    event.preventDefault();
+    const currentSize = direction === 'x'
+      ? handle.previousElementSibling.getBoundingClientRect().width
+      : handle.parentElement.getBoundingClientRect().height;
+    setSize(currentSize + change, true);
+  });
+}
+
+const mainEl = document.querySelector('main');
+setupResizeHandle(treeResizer, 'x', () => ({
+  min: 150,
+  max: Math.max(260, editorPane.clientWidth - 220),
+}), (size) => {
+  treeSidebar.style.width = `${size}px`;
+}, 'tree-width', 220);
+
+setupResizeHandle(paneResizer, 'x', () => ({
+  min: 320,
+  max: Math.max(420, mainEl.clientWidth - 320),
+}), (size) => {
+  editorPane.style.flexBasis = `${size}px`;
+}, 'editor-width', mainEl.clientWidth / 2);
+
+setupResizeHandle(logResizer, 'y', () => ({
+  min: 70,
+  max: Math.max(140, previewPane.clientHeight * 0.7),
+}), (size) => {
+  logPanel.style.height = `${size}px`;
+}, 'log-height', 220);
+
 // Editor
-// ---------------------------------------------------------------------------
 const cm = CodeMirror.fromTextArea(document.getElementById('source'), {
   mode: 'stex',
   theme: 'eclipse',
@@ -35,9 +125,7 @@ const cm = CodeMirror.fromTextArea(document.getElementById('source'), {
   indentUnit: 2,
 });
 
-// ---------------------------------------------------------------------------
 // State
-// ---------------------------------------------------------------------------
 let currentProject = null;
 let currentFile = null; // { path, editable }
 let dirty = false;
@@ -55,9 +143,7 @@ function setDirty(value) {
   saveBtn.classList.toggle('dirty', dirty);
 }
 
-// ---------------------------------------------------------------------------
 // tectonic status
-// ---------------------------------------------------------------------------
 async function refreshTectonicStatus() {
   try {
     const res = await fetch('/api/tectonic-status');
@@ -75,9 +161,7 @@ async function refreshTectonicStatus() {
   }
 }
 
-// ---------------------------------------------------------------------------
 // Projects
-// ---------------------------------------------------------------------------
 async function loadProjects(selectName) {
   const res = await fetch('/api/projects');
   const data = await res.json();
@@ -128,9 +212,7 @@ newProjectBtn.addEventListener('click', async () => {
   await loadProjects(name);
 });
 
-// ---------------------------------------------------------------------------
 // File tree
-// ---------------------------------------------------------------------------
 async function loadTree() {
   if (!currentProject) return;
   const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/tree`);
@@ -187,9 +269,7 @@ function renderNode(node) {
   return container;
 }
 
-// ---------------------------------------------------------------------------
 // Open / save file
-// ---------------------------------------------------------------------------
 async function openFile(node) {
   if (dirty) {
     const proceed = confirm(`Discard unsaved changes to "${currentFile.path}"?`);
@@ -256,9 +336,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // New file / folder
-// ---------------------------------------------------------------------------
 async function createEntry(type) {
   if (!currentProject) return;
   const label = type === 'dir' ? 'folder' : 'file';
@@ -289,9 +367,7 @@ function isTextEditableClientSide(relPath) {
 newFileBtn.addEventListener('click', () => createEntry('file'));
 newFolderBtn.addEventListener('click', () => createEntry('dir'));
 
-// ---------------------------------------------------------------------------
 // Compile
-// ---------------------------------------------------------------------------
 function setToolbar(text, kind) {
   toolbarEl.textContent = text;
   toolbarEl.className = kind || '';
@@ -368,8 +444,6 @@ async function compile() {
 
 compileBtn.addEventListener('click', compile);
 
-// ---------------------------------------------------------------------------
 // Init
-// ---------------------------------------------------------------------------
 refreshTectonicStatus();
 loadProjects();

@@ -100,19 +100,61 @@ main {
 }
 
 #editor-pane, #preview-pane {
-  flex: 1 1 50%;
   min-width: 0;
   display: flex;
 }
 
 #editor-pane {
-  border-right: 1px solid var(--border);
+  flex: 0 1 var(--editor-width, 50%);
+}
+
+#preview-pane {
+  flex: 1 1 auto;
+  min-width: 240px;
+}
+
+.resize-handle {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+}
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  background: var(--border);
+  transition: background 120ms ease;
+}
+.resize-handle:hover::after,
+.resize-handle:focus-visible::after,
+body.is-resizing .resize-handle::after {
+  background: var(--accent);
+}
+.resize-handle-vertical {
+  width: 7px;
+  cursor: col-resize;
+}
+.resize-handle-vertical::after {
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+}
+.resize-handle-horizontal {
+  height: 7px;
+  cursor: row-resize;
+}
+.resize-handle-horizontal::after {
+  top: 3px;
+  right: 0;
+  left: 0;
+  height: 1px;
 }
 
 /* --- File tree sidebar --- */
 
 #tree-sidebar {
-  width: 220px;
+  width: var(--tree-width, 220px);
   flex-shrink: 0;
   border-right: 1px solid var(--border);
   background: #fafbfc;
@@ -242,11 +284,18 @@ main {
   border-top: 1px solid var(--border);
   background: #1e1e1e;
   color: #f1f1f1;
-  max-height: 40%;
+  height: var(--log-height, 220px);
+  min-height: 70px;
+  max-height: 70%;
   display: flex;
   flex-direction: column;
 }
 #log-panel.hidden { display: none; }
+
+#log-panel .resize-handle {
+  flex: 0 0 7px;
+  background: #1e1e1e;
+}
 
 #log-panel-header {
   display: flex;

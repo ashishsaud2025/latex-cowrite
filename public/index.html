@@ -41,6 +41,7 @@
       </div>
       <div id="tree-container"></div>
     </div>
+    <div id="tree-resizer" class="resize-handle resize-handle-vertical" role="separator" aria-label="Resize file tree" aria-orientation="vertical" tabindex="0"></div>
     <div id="editor-container">
       <div id="editor-tab-bar">
         <span id="active-file-name">No file open</span>
@@ -50,6 +51,7 @@
     </div>
   </section>
 
+  <div id="pane-resizer" class="resize-handle resize-handle-vertical" role="separator" aria-label="Resize editor and PDF preview" aria-orientation="vertical" tabindex="0"></div>
   <section id="preview-pane">
     <div id="preview-toolbar">
       <span id="compile-state"></span>
@@ -58,6 +60,7 @@
       <p id="pdf-placeholder">Click "Compile" to render a preview.</p>
     </div>
     <div id="log-panel" class="hidden">
+      <div id="log-resizer" class="resize-handle resize-handle-horizontal" role="separator" aria-label="Resize compile log" aria-orientation="horizontal" tabindex="0"></div>
       <div id="log-panel-header">
         <strong>Compile log</strong>
         <button id="log-close">×</button>
