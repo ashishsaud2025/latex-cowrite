@@ -9,24 +9,36 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const COMPILE_TIMEOUT_MS = 10_000;
-const MAX_SOURCE_BYTES = 2 * 1024 * 1024; // 2MB of LaTeX source is already a lot
+const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write
+const MAX_PROJECT_BYTES = 25 * 1024 * 1024;    // cap for total project size when compiling
+
+// Where all projects live on disk -- a folder at the same level as
+// server.js/public/. Each subdirectory of this is one project; each
+// project's own subdirectory structure is shown as the file tree in the
+// UI and is exactly what gets compiled (so \input, \include,
+// \includegraphics, \bibliography etc. all resolve normally).
+const PROJECTS_ROOT = path.join(__dirname, 'projects');
+
+// Extensions we treat as editable text in the browser. Anything else
+// (images, existing PDFs, etc.) still shows up in the tree so the folder
+// layout is visible, but isn't opened as text -- reading/writing a binary
+// file as utf8 would corrupt it.
+const TEXT_EXTENSIONS = new Set([
+  '.tex', '.bib', '.cls', '.sty', '.txt', '.md', '.json', '.yml', '.yaml', '.log',
+]);
 
 // If true, adds --only-cached so tectonic refuses to reach out to the network
 // for *any* package it doesn't already have cached, instead of silently
-// fetching. This does NOT sandbox the network at the OS level (see README /
-// the note at the bottom of this file) -- it only stops tectonic itself from
-// trying. Off by default because most fresh installs need one online
-// compile to warm the bundle cache; flip it on once you've done that.
+// fetching. This does NOT sandbox the network at the OS level -- it only
+// stops tectonic itself from trying. Off by default because most fresh
+// installs need one online compile to warm the bundle cache.
 const ONLY_CACHED = process.env.TECTONIC_ONLY_CACHED === '1';
 
 const app = express();
 app.use(express.json({ limit: '3mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Startup check: does `tectonic` exist on PATH at all? We check once at boot
-// so the failure is loud and obvious in server logs, and again lazily on
-// every compile request so the frontend gets a clear error instead of a
-// generic 500 if it's missing or gets uninstalled later.
+// tectonic availability check (unchanged from before)
 function checkTectonicAvailable() {
   const result = spawnSync('tectonic', ['--version'], { encoding: 'utf8' });
   if (result.error || result.status !== 0) {
@@ -40,31 +52,259 @@ if (!startupCheck.available) {
   console.warn('=================================================================');
   console.warn(' WARNING: `tectonic` was not found on PATH.');
   console.warn(' Install it before compiling will work: https://tectonic-typesetting.github.io/');
-  console.warn(' (macOS: brew install tectonic | Debian/Ubuntu: check your distro repo');
-  console.warn('  or grab a release binary from the GitHub releases page.)');
   console.warn('=================================================================');
 } else {
   console.log(`tectonic found: ${startupCheck.detail}`);
 }
 
-// Lets the frontend show a banner instead of just failing the first compile.
 app.get('/api/tectonic-status', (req, res) => {
-  const status = checkTectonicAvailable();
-  res.json(status);
+  res.json(checkTectonicAvailable());
 });
 
-// POST /api/compile
-// Body: { source: string }
-// Success: 200, Content-Type: application/pdf, raw PDF bytes
-// Failure: 4xx/5xx, JSON: { error: string, log: string }
-app.post('/api/compile', async (req, res) => {
-  const source = req.body && req.body.source;
-
-  if (typeof source !== 'string' || source.trim().length === 0) {
-    return res.status(400).json({ error: 'Request body must include a non-empty "source" string.', log: '' });
+// Projects root setup: create the folder if missing, seed a demo project
+// if there are no projects at all yet (so the UI never opens to an empty
+// state on a fresh checkout).
+async function ensureProjectsRoot() {
+  await fs.mkdir(PROJECTS_ROOT, { recursive: true });
+  const entries = await fs.readdir(PROJECTS_ROOT, { withFileTypes: true });
+  const hasAnyProject = entries.some((e) => e.isDirectory() && !e.name.startsWith('.'));
+  if (!hasAnyProject) {
+    await seedDemoProject();
   }
-  if (Buffer.byteLength(source, 'utf8') > MAX_SOURCE_BYTES) {
-    return res.status(413).json({ error: `Source exceeds ${MAX_SOURCE_BYTES} byte limit.`, log: '' });
+}
+
+async function seedDemoProject() {
+  const demoRoot = path.join(PROJECTS_ROOT, 'demo');
+  await fs.mkdir(path.join(demoRoot, 'sections'), { recursive: true });
+  await fs.writeFile(
+    path.join(demoRoot, 'main.tex'),
+    `\\documentclass{article}
+\\title{Hello, latex-cowrite}
+\\author{You}
+\\begin{document}
+\\maketitle
+
+\\input{sections/intro}
+
+\\end{document}
+`,
+    'utf8'
+  );
+  await fs.writeFile(
+    path.join(demoRoot, 'sections', 'intro.tex'),
+    `\\section{Introduction}
+This file lives at \\texttt{sections/intro.tex} and is pulled in from
+\\texttt{main.tex} via \\verb|\\input|. Edit either file in the tree on the
+left, hit Compile, and both are included in the build.
+`,
+    'utf8'
+  );
+}
+
+// Path safety helpers
+const PROJECT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+
+function projectRootFor(projectName) {
+  if (typeof projectName !== 'string' || !PROJECT_NAME_RE.test(projectName)) return null;
+  return path.join(PROJECTS_ROOT, projectName);
+}
+
+async function projectExists(projectRoot) {
+  try {
+    const st = await fs.stat(projectRoot);
+    return st.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// Resolves a client-supplied relative path against a project root and
+// verifies the result can't escape that root (blocks "../../etc/passwd"
+// style traversal). Returns null if unsafe.
+function resolveSafePath(projectRoot, relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) return null;
+  const normalized = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  if (normalized.split('/').includes('..')) return null;
+  const rootResolved = path.resolve(projectRoot);
+  const abs = path.resolve(rootResolved, normalized);
+  if (abs !== rootResolved && !abs.startsWith(rootResolved + path.sep)) return null;
+  return abs;
+}
+
+function isTextEditable(relPath) {
+  return TEXT_EXTENSIONS.has(path.extname(relPath).toLowerCase());
+}
+
+// GET /api/projects -> list of project names
+app.get('/api/projects', async (req, res) => {
+  try {
+    const entries = await fs.readdir(PROJECTS_ROOT, { withFileTypes: true });
+    const names = entries
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)
+      .sort();
+    res.json({ projects: names });
+  } catch (err) {
+    res.status(500).json({ error: `Could not list projects: ${err.message}` });
+  }
+});
+
+// POST /api/projects -> create a new, empty (seeded) project
+// Body: { name: string }
+app.post('/api/projects', async (req, res) => {
+  const name = req.body && req.body.name;
+  const root = projectRootFor(name);
+  if (!root) {
+    return res.status(400).json({ error: 'Project name must be non-empty and use only letters, numbers, "-", "_".' });
+  }
+  if (await projectExists(root)) {
+    return res.status(409).json({ error: `Project "${name}" already exists.` });
+  }
+  try {
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(
+      path.join(root, 'main.tex'),
+      '\\documentclass{article}\n\\begin{document}\n\n\\end{document}\n',
+      'utf8'
+    );
+    res.status(201).json({ name });
+  } catch (err) {
+    res.status(500).json({ error: `Could not create project: ${err.message}` });
+  }
+});
+
+// GET /api/projects/:project/tree -> nested file/folder listing
+app.get('/api/projects/:project/tree', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+  try {
+    const children = await buildTree(root, '');
+    res.json({ name: req.params.project, path: '', type: 'dir', children });
+  } catch (err) {
+    res.status(500).json({ error: `Could not read project tree: ${err.message}` });
+  }
+});
+
+async function buildTree(dirAbsPath, relPath) {
+  const entries = await fs.readdir(dirAbsPath, { withFileTypes: true });
+  entries.sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  const out = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const childRel = relPath ? `${relPath}/${entry.name}` : entry.name;
+    const childAbs = path.join(dirAbsPath, entry.name);
+    if (entry.isDirectory()) {
+      out.push({
+        name: entry.name,
+        path: childRel,
+        type: 'dir',
+        children: await buildTree(childAbs, childRel),
+      });
+    } else {
+      out.push({ name: entry.name, path: childRel, type: 'file', editable: isTextEditable(childRel) });
+    }
+  }
+  return out;
+}
+
+// GET /api/projects/:project/file?path=relPath -> { path, content }
+app.get('/api/projects/:project/file', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+  const relPath = req.query.path;
+  const abs = resolveSafePath(root, relPath);
+  if (!abs) return res.status(400).json({ error: 'Invalid path.' });
+  if (!isTextEditable(relPath)) {
+    return res.status(415).json({ error: 'This file type is not editable as text in this app.' });
+  }
+  try {
+    const stat = await fs.stat(abs);
+    if (!stat.isFile()) return res.status(400).json({ error: 'Not a file.' });
+    if (stat.size > MAX_FILE_BYTES) {
+      return res.status(413).json({ error: `File exceeds ${MAX_FILE_BYTES} byte limit.` });
+    }
+    const content = await fs.readFile(abs, 'utf8');
+    res.json({ path: relPath, content });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'File not found.' });
+    res.status(500).json({ error: `Could not read file: ${err.message}` });
+  }
+});
+
+// PUT /api/projects/:project/file -> save file content
+// Body: { path: string, content: string }
+app.put('/api/projects/:project/file', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+  const { path: relPath, content } = req.body || {};
+  const abs = resolveSafePath(root, relPath);
+  if (!abs) return res.status(400).json({ error: 'Invalid path.' });
+  if (!isTextEditable(relPath)) {
+    return res.status(415).json({ error: 'This file type is not editable as text in this app.' });
+  }
+  if (typeof content !== 'string') {
+    return res.status(400).json({ error: '"content" must be a string.' });
+  }
+  if (Buffer.byteLength(content, 'utf8') > MAX_FILE_BYTES) {
+    return res.status(413).json({ error: `Content exceeds ${MAX_FILE_BYTES} byte limit.` });
+  }
+  try {
+    await fs.writeFile(abs, content, 'utf8');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: `Could not save file: ${err.message}` });
+  }
+});
+
+// POST /api/projects/:project/entries -> create an empty file or folder
+// Body: { path: string, type: 'file' | 'dir' }
+app.post('/api/projects/:project/entries', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+  const { path: relPath, type } = req.body || {};
+  const abs = resolveSafePath(root, relPath);
+  if (!abs || (type !== 'file' && type !== 'dir')) {
+    return res.status(400).json({ error: 'Invalid path or type.' });
+  }
+  try {
+    const already = await fs
+      .access(abs)
+      .then(() => true)
+      .catch(() => false);
+    if (already) return res.status(409).json({ error: 'That path already exists.' });
+
+    if (type === 'dir') {
+      await fs.mkdir(abs, { recursive: true });
+    } else {
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, '', 'utf8');
+    }
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: `Could not create entry: ${err.message}` });
+  }
+});
+
+// POST /api/projects/:project/compile
+// Compiles the project's entry file (main.tex if present, else the first
+// top-level .tex file). Success: 200 application/pdf. Failure: JSON
+// { error, log, entry }.
+app.post('/api/projects/:project/compile', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.', log: '', entry: null });
   }
 
   const status = checkTectonicAvailable();
@@ -72,31 +312,55 @@ app.post('/api/compile', async (req, res) => {
     return res.status(500).json({
       error: 'tectonic is not installed or not on PATH on the server. See server logs.',
       log: '',
+      entry: null,
     });
   }
 
-  // One temp dir per compile. This is our sandbox boundary: tectonic is
-  // pointed at this directory as both cwd and output dir, and it's the only
-  // thing we delete/rely on afterwards -- we never touch a user-supplied
-  // path.
+  let entryRel;
+  try {
+    entryRel = await findEntryFile(root);
+  } catch (err) {
+    return res.status(500).json({ error: `Could not inspect project: ${err.message}`, log: '', entry: null });
+  }
+  if (!entryRel) {
+    return res.status(400).json({
+      error: 'No .tex entry file found. Add a main.tex (or any top-level .tex file) to compile.',
+      log: '',
+      entry: null,
+    });
+  }
+
+  const projectSize = await dirSizeBytes(root, MAX_PROJECT_BYTES + 1);
+  if (projectSize > MAX_PROJECT_BYTES) {
+    return res.status(413).json({
+      error: `Project exceeds ${MAX_PROJECT_BYTES} byte limit.`,
+      log: '',
+      entry: entryRel,
+    });
+  }
+
+  // Compile from a throwaway copy of the whole project, not the project
+  // directory itself -- this is our sandbox boundary (same as before), and
+  // it also keeps tectonic's build byproducts (.aux, .log, the .pdf) out
+  // of the user's actual project folder.
   const jobId = crypto.randomBytes(8).toString('hex');
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `texcomp-${jobId}-`));
-  const texPath = path.join(tmpDir, 'main.tex');
-  const pdfPath = path.join(tmpDir, 'main.pdf');
-  const logPath = path.join(tmpDir, 'main.log');
+
+  const entryBase = path.basename(entryRel, '.tex');
+  const pdfPath = path.join(tmpDir, `${entryBase}.pdf`);
+  const logPath = path.join(tmpDir, `${entryBase}.log`);
 
   try {
-    await fs.writeFile(texPath, source, 'utf8');
+    await fs.cp(root, tmpDir, { recursive: true });
 
     const args = [
-      '--untrusted',   // hard-disables shell-escape and other unsafe features,
-                        // overriding anything the document itself requests
+      '--untrusted',
       '-o', tmpDir,
       '--keep-logs',
       '--reruns', '1',
     ];
     if (ONLY_CACHED) args.push('--only-cached');
-    args.push(texPath);
+    args.push(path.join(tmpDir, entryRel));
 
     const result = await runTectonic(args, tmpDir);
 
@@ -105,67 +369,81 @@ app.post('/api/compile', async (req, res) => {
       return res.status(504).json({
         error: `Compilation timed out after ${COMPILE_TIMEOUT_MS / 1000}s.`,
         log: combineLog(result.stdout, result.stderr, log),
+        entry: entryRel,
       });
     }
-
     if (result.code !== 0) {
       const log = await readIfExists(logPath);
       return res.status(422).json({
         error: `tectonic exited with code ${result.code}.`,
         log: combineLog(result.stdout, result.stderr, log),
+        entry: entryRel,
       });
     }
 
-    const pdfExists = await fs
-      .access(pdfPath)
-      .then(() => true)
-      .catch(() => false);
-
+    const pdfExists = await fs.access(pdfPath).then(() => true).catch(() => false);
     if (!pdfExists) {
       const log = await readIfExists(logPath);
       return res.status(422).json({
         error: 'tectonic reported success but produced no PDF.',
         log: combineLog(result.stdout, result.stderr, log),
+        entry: entryRel,
       });
     }
 
     const pdf = await fs.readFile(pdfPath);
     res.set('Content-Type', 'application/pdf');
+    res.set('X-Compiled-Entry', entryRel);
     return res.status(200).send(pdf);
   } catch (err) {
-    return res.status(500).json({ error: `Server error: ${err.message}`, log: '' });
+    return res.status(500).json({ error: `Server error: ${err.message}`, log: '', entry: entryRel });
   } finally {
-    // Always clean up, success or failure.
     fs.rm(tmpDir, { recursive: true, force: true }).catch((err) => {
       console.error(`Failed to remove temp dir ${tmpDir}:`, err.message);
     });
   }
 });
 
-/**
- * Spawn tectonic with no shell, a fixed cwd, and a hard timeout.
- * shell:false (the default for spawn) is important -- it means args are
- * passed straight to execve, not interpreted by /bin/sh, so nothing in the
- * LaTeX source or filenames can smuggle in extra shell commands.
- */
+async function findEntryFile(root) {
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const topTexFiles = entries
+    .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.tex'))
+    .map((e) => e.name)
+    .sort();
+  if (topTexFiles.includes('main.tex')) return 'main.tex';
+  return topTexFiles[0] || null;
+}
+
+async function dirSizeBytes(dirAbsPath, stopAfter) {
+  let total = 0;
+  async function walk(p) {
+    if (total > stopAfter) return;
+    const entries = await fs.readdir(p, { withFileTypes: true });
+    for (const entry of entries) {
+      if (total > stopAfter) return;
+      const abs = path.join(p, entry.name);
+      if (entry.isDirectory()) {
+        await walk(abs);
+      } else {
+        const st = await fs.stat(abs);
+        total += st.size;
+      }
+    }
+  }
+  await walk(dirAbsPath);
+  return total;
+}
+
+// tectonic process runner (unchanged behavior from the single-file MVP)
 function runTectonic(args, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn('tectonic', args, {
       cwd,
       shell: false,
-      // Own process group so a timeout can kill tectonic *and* anything it
-      // spawns (e.g. if a package ever shells out). Killing just child.pid
-      // only gets the direct child -- any grandchild keeps running, and
-      // since it inherits the stdout/stderr pipes, node's 'close' event
-      // would then hang until that grandchild exits on its own, defeating
-      // the timeout. Listening on 'exit' + killing the group avoids both
-      // problems.
-      detached: true,
+      detached: true, // own process group, so a timeout can kill the whole tree
       env: {
-        // Minimal env. Keep PATH so tectonic can find its own resources;
-        // drop everything else the parent process happens to have.
         PATH: process.env.PATH,
-        HOME: process.env.HOME, // tectonic caches its bundle under $HOME/.cache
+        HOME: process.env.HOME,
       },
     });
 
@@ -177,18 +455,14 @@ function runTectonic(args, cwd) {
     const timer = setTimeout(() => {
       timedOut = true;
       try {
-        process.kill(-child.pid, 'SIGKILL'); // negative pid = whole group
+        process.kill(-child.pid, 'SIGKILL');
       } catch {
-        child.kill('SIGKILL'); // fallback if the group is already gone
+        child.kill('SIGKILL');
       }
     }, COMPILE_TIMEOUT_MS);
 
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
 
     child.on('error', (err) => {
       if (settled) return;
@@ -216,12 +490,18 @@ async function readIfExists(filePath) {
 
 function combineLog(stdout, stderr, texLog) {
   const parts = [];
-  if (texLog) parts.push('--- main.log ---\n' + texLog);
+  if (texLog) parts.push('--- log ---\n' + texLog);
   if (stdout) parts.push('--- stdout ---\n' + stdout);
   if (stderr) parts.push('--- stderr ---\n' + stderr);
   return parts.join('\n\n') || '(no output captured)';
 }
 
-app.listen(PORT, () => {
-  console.log(`latex-editor-mvp listening on http://localhost:${PORT}`);
-});
+ensureProjectsRoot()
+  .catch((err) => {
+    console.error('Failed to set up projects/ directory:', err.message);
+  })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`latex-cowrite listening on http://localhost:${PORT}`);
+    });
+  });

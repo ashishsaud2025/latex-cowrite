@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>LaTeX Editor</title>
+<title>LaTeX Cowrite</title>
 
 <!-- CodeMirror 5 for the source editor -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" />
@@ -21,14 +21,33 @@
 <header>
   <h1>LaTeX Editor <span class="tag">Single-User(for now)</span></h1>
   <div class="header-actions">
+    <select id="project-select" title="Active project"></select>
+    <button id="new-project-btn" title="Create a new project">+ Project</button>
     <span id="tectonic-status" class="status-pill status-unknown">checking tectonic…</span>
+    <button id="save-btn" disabled>Save</button>
     <button id="compile-btn">Compile</button>
   </div>
 </header>
 
 <main>
   <section id="editor-pane">
-    <textarea id="source"></textarea>
+    <div id="tree-sidebar">
+      <div id="tree-toolbar">
+        <span>Files</span>
+        <div class="tree-toolbar-actions">
+          <button id="new-file-btn" title="New file">+ File</button>
+          <button id="new-folder-btn" title="New folder">+ Folder</button>
+        </div>
+      </div>
+      <div id="tree-container"></div>
+    </div>
+    <div id="editor-container">
+      <div id="editor-tab-bar">
+        <span id="active-file-name">No file open</span>
+        <span id="dirty-indicator" class="hidden">● unsaved</span>
+      </div>
+      <textarea id="source"></textarea>
+    </div>
   </section>
 
   <section id="preview-pane">
