@@ -1,1 +1,0 @@
-- Add the feature to make the test window larger or the compiled pdf window larger(draggable) same for file system layout.
