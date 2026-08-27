@@ -4,11 +4,12 @@ Self-hosted collaborative LaTeX editor (Overleaf-style).
 
 This is **Phase 1**: a single-user editor with a working compile pipeline. Real-time multi-user sync using Yjs is planned for Phase 2.
 
-* LaTeX source editor (CodeMirror) on the left
+* Multi-file **projects**, each with its own folder on disk under `projects/`
+* File tree on the left you can browse, open, and edit (CodeMirror), alongside a project picker and "+ New Project" / "+ New File" / "+ New Folder"
 * PDF preview (PDF.js) on the right
-* Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/)
+* Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/) — compiles the whole project (so `\input`, `\include`, and other in-project references resolve correctly), not just a single file
 * Compile errors shown in a log panel
-* Each compile runs in its own temporary directory with a timeout
+* Each compile runs against a throwaway copy of the project in its own temporary directory, with a timeout
 
 ## Step-by-step setup
 
@@ -164,6 +165,31 @@ http://localhost:3000
 
 Enter some LaTeX in the left pane and click **Compile**.
 
+## Working with projects
+
+Everything lives under a `projects/` folder at the repo root (created automatically on first run). Each subfolder is one project:
+
+```text
+projects/
+  demo/
+    main.tex
+    sections/
+      intro.tex
+  your-project/
+    main.tex
+    figures/
+      diagram.png
+    refs.bib
+```
+
+* A **demo** project is seeded automatically the first time you run the app, so the UI never opens empty.
+* Use the project dropdown in the header to switch between projects, and **+ Project** to create a new one (it's seeded with an empty `main.tex`).
+* The file tree on the left shows the whole folder layout for the active project. Click a file to open it; click a folder to expand/collapse it.
+* **+ File** / **+ Folder** create a new entry at a path you type (e.g. `sections/results.tex` or `figures`), including any missing parent folders.
+* Only recognized text files are editable in the browser: `.tex .bib .cls .sty .txt .md .json .yml .yaml .log`. Anything else (images, existing PDFs, etc.) still shows in the tree so the layout is visible, but isn't opened as text.
+* **Compile** always builds `main.tex` if one exists at the project's top level, otherwise the first `.tex` file it finds there. There's no per-file "set as main" yet, see Roadmap.
+* You can also add files to a project directly on disk (drag a folder into `projects/your-project/`), the tree picks up anything there on next load, no restart needed.
+
 ## First-run network note
 
 By default, if a document requires a package that is not already cached, Tectonic may try to download it during compilation.
@@ -178,22 +204,22 @@ This is recommended when the application is being used by multiple users.
 
 ## What's sandboxed and what isn't
 
-Each compilation runs in its own temporary directory:
+Each compilation copies the whole project into its own temporary directory:
 
 ```text
 os.tmpdir()/texcomp-<id>
 ```
 
-The directory is deleted after the compilation finishes, fails, or times out.
+Tectonic runs against that copy, never the project folder itself so build byproducts (`.aux`, `.log`, the output `.pdf`) never land in your actual project, and the temp copy is deleted after the compilation finishes, fails, or times out.
 
 The following protections are currently enabled:
 
 * `--untrusted` is always passed to Tectonic. This disables shell escape and other potentially dangerous TeX features.
 * The compile process is started directly with `shell: false`.
 * Arguments are passed directly to the operating system instead of through a shell.
-* A timeout is applied to every compilation.
-* The entire process group is terminated when a compilation times out.
-* LaTeX input is limited to 2 MB.
+* A timeout is applied to every compilation; the entire process group is terminated on timeout (not just the top process), so a hung compile can't outlive it or leak a subprocess.
+* A single file save is limited to 2 MB; total project size is limited to 25 MB per compile.
+* Path traversal is blocked on every file/folder API, a requested path that would resolve outside the project's own folder (e.g. `../../etc/passwd`) is rejected.
 
 The following protections are **not** included in Phase 1:
 
@@ -226,46 +252,85 @@ An asynchronous job queue with polling or WebSocket support is planned for a fut
 
 Returns the availability of Tectonic.
 
-Example response:
+```json
+{ "available": true, "detail": "Tectonic 0.17.0" }
+```
+
+### `GET /api/projects`
+
+Lists project names.
+
+```json
+{ "projects": ["demo", "your-project"] }
+```
+
+### `POST /api/projects`
+
+Creates a new project, seeded with an empty `main.tex`.
+
+Request body: `{ "name": "your-project" }` and only letters, numbers, `-`, `_` are allowed as name for e.g. "test$&" is not allowed but "test_1-2" is allowed.
+
+`201` on success, `409` if the name is already taken.
+
+### `GET /api/projects/:project/tree`
+
+Returns the project's file/folder layout.
 
 ```json
 {
-  "available": true,
-  "detail": "Tectonic is available"
+  "name": "demo",
+  "path": "",
+  "type": "dir",
+  "children": [
+    { "name": "main.tex", "path": "main.tex", "type": "file", "editable": true },
+    { "name": "sections", "path": "sections", "type": "dir", "children": [ ... ] }
+  ]
 }
 ```
 
-### `POST /api/compile`
+### `GET /api/projects/:project/file?path=<relative path>`
 
-Request body:
+Returns a text file's content. `415` if the file's extension isn't in the editable text list.
 
 ```json
-{
-  "source": "<latex source>"
-}
+{ "path": "main.tex", "content": "\\documentclass{article}..." }
 ```
+
+### `PUT /api/projects/:project/file`
+
+Saves a text file's content.
+
+Request body: `{ "path": "main.tex", "content": "..." }`
+
+### `POST /api/projects/:project/entries`
+
+Creates an empty file or folder (and any missing parent folders).
+
+Request body: `{ "path": "sections/results.tex", "type": "file" }` (`type` is `"file"` or `"dir"`)
+
+`201` on success, `409` if the path already exists.
+
+### `POST /api/projects/:project/compile`
+
+Compiles the project's entry file (`main.tex` if present at the top level, otherwise the first top-level `.tex` file).
 
 On success:
 
 ```text
 200 OK
 Content-Type: application/pdf
+X-Compiled-Entry: main.tex
 ```
 
-The response contains the raw PDF bytes.
+The response body is the raw PDF bytes.
 
-On failure:
-
-```text
-4xx/5xx
-```
-
-Example response:
+On failure (`4xx`/`5xx`):
 
 ```json
 {
-  "error": "Compilation failed",
-  "log": "<tectonic compilation log>"
+  "error": "tectonic exited with code 1.",
+  "log": "<tectonic compilation log>",
+  "entry": "main.tex"
 }
 ```
 
@@ -286,4 +351,5 @@ The goal is to use CRDT-based synchronization so multiple users can edit the sam
 * Stronger filesystem isolation
 * CPU and memory limits
 * Container-based compilation
-* Better project and file management
+* Per-file "set as main" instead of always inferring `main.tex`
+* Uploading a project as a zip, and renaming/deleting files or folders from the UI
