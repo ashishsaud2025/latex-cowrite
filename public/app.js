@@ -1,8 +1,5 @@
 'use strict';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
 // ---------------------------------------------------------------------------
 // DOM refs
 // ---------------------------------------------------------------------------
@@ -28,6 +25,8 @@ const treeSidebar = document.getElementById('tree-sidebar');
 const treeResizer = document.getElementById('tree-resizer');
 const paneResizer = document.getElementById('pane-resizer');
 const logResizer = document.getElementById('log-resizer');
+const collaborationStatus = document.getElementById('collaboration-status');
+let pdfObjectUrl = null;
 
 function loadWorkspaceSize(name, fallback) {
   const value = Number(localStorage.getItem(`longtex-${name}`));
@@ -131,11 +130,126 @@ let currentFile = null; // { path, editable }
 let expandedFolders = new Set();
 let dirty = false;
 let suppressChangeEvents = false;
+let collaborationSocket = null;
+let collaborationReconnectTimer = null;
+const collaborationSenderId = crypto.randomUUID();
+let collaborationEditTimer = null;
+let collaborationColor = '#d6336c';
+const remoteCursors = new Map();
+
+function setCollaborationStatus(text, kind = 'unknown') {
+  collaborationStatus.textContent = text;
+  collaborationStatus.className = `status-pill status-${kind}`;
+}
+
+function clearRemoteCursors() {
+  for (const marker of remoteCursors.values()) marker.clear();
+  remoteCursors.clear();
+}
+
+function sendCollaborationCursor() {
+  if (!collaborationSocket || collaborationSocket.readyState !== WebSocket.OPEN
+    || !currentFile || !currentFile.editable) return;
+  const cursor = cm.getCursor();
+  collaborationSocket.send(JSON.stringify({
+    type: 'cursor',
+    senderId: collaborationSenderId,
+    path: currentFile.path,
+    line: cursor.line,
+    ch: cursor.ch,
+  }));
+}
+
+function renderRemoteCursor(message) {
+  if (message.senderId === collaborationSenderId || !currentFile
+    || currentFile.path !== message.path) return;
+  const previous = remoteCursors.get(message.senderId);
+  if (previous) previous.clear();
+
+  const cursorElement = document.createElement('span');
+  cursorElement.className = 'remote-cursor';
+  cursorElement.style.borderColor = message.color;
+  const label = document.createElement('span');
+  label.className = 'remote-cursor-label';
+  label.textContent = message.senderId.slice(0, 6);
+  label.style.backgroundColor = message.color;
+  cursorElement.appendChild(label);
+
+  const marker = cm.setBookmark({ line: message.line, ch: message.ch }, {
+    widget: cursorElement,
+    insertLeft: true,
+  });
+  remoteCursors.set(message.senderId, marker);
+}
+
+function connectCollaboration() {
+  if (!currentProject) return;
+  if (collaborationSocket) collaborationSocket.close();
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  collaborationSocket = new WebSocket(
+    `${protocol}//${location.host}/collaboration/${encodeURIComponent(currentProject)}`
+  );
+  collaborationSocket.addEventListener('open', () => {
+    setCollaborationStatus('collaborating', 'ok');
+  });
+  collaborationSocket.addEventListener('message', (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === 'connected') {
+      collaborationColor = message.color;
+      collaborationSocket.send(JSON.stringify({ type: 'hello', senderId: collaborationSenderId }));
+      sendCollaborationCursor();
+      return;
+    }
+    if (message.type === 'cursor') {
+      renderRemoteCursor(message);
+      return;
+    }
+    if (message.type === 'leave') {
+      const marker = remoteCursors.get(message.senderId);
+      if (marker) marker.clear();
+      remoteCursors.delete(message.senderId);
+      return;
+    }
+    if (message.type !== 'edit' || message.senderId === collaborationSenderId) return;
+    if (!currentFile || currentFile.path !== message.path) return;
+    suppressChangeEvents = true;
+    cm.setValue(message.content);
+    suppressChangeEvents = false;
+    setDirty(false);
+  });
+  collaborationSocket.addEventListener('close', () => {
+    clearRemoteCursors();
+    setCollaborationStatus('reconnecting…', 'unknown');
+    clearTimeout(collaborationReconnectTimer);
+    collaborationReconnectTimer = setTimeout(connectCollaboration, 1000);
+  });
+  collaborationSocket.addEventListener('error', () => {
+    setCollaborationStatus('offline', 'missing');
+  });
+}
+
+function queueCollaborationEdit() {
+  if (!collaborationSocket || collaborationSocket.readyState !== WebSocket.OPEN || !currentFile) return;
+  clearTimeout(collaborationEditTimer);
+  collaborationEditTimer = setTimeout(() => {
+    collaborationSocket.send(JSON.stringify({
+      type: 'edit',
+      path: currentFile.path,
+      content: cm.getValue(),
+      senderId: collaborationSenderId,
+    }));
+  }, 250);
+}
 
 cm.on('change', () => {
   if (suppressChangeEvents) return;
-  if (currentFile && currentFile.editable) setDirty(true);
+  if (currentFile && currentFile.editable) {
+    setDirty(true);
+    queueCollaborationEdit();
+  }
 });
+
+cm.on('cursorActivity', sendCollaborationCursor);
 
 function setDirty(value) {
   dirty = value;
@@ -184,6 +298,7 @@ async function loadProjects(selectName) {
 }
 
 async function switchProject(name) {
+  clearRemoteCursors();
   currentProject = name;
   currentFile = null;
   expandedFolders = new Set();
@@ -193,6 +308,7 @@ async function switchProject(name) {
   cm.setValue('');
   suppressChangeEvents = false;
   cm.setOption('readOnly', true);
+  connectCollaboration();
   await loadTree();
 }
 
@@ -346,6 +462,7 @@ async function openFile(node) {
   suppressChangeEvents = false;
   cm.setOption('readOnly', false);
   setDirty(false);
+  sendCollaborationCursor();
   loadTree();
 }
 
@@ -480,19 +597,16 @@ function hideLog() {
 
 logClose.addEventListener('click', hideLog);
 
-async function renderPdf(arrayBuffer) {
+function renderPdf(arrayBuffer) {
   pdfContainer.innerHTML = '';
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 1.4 });
-    const canvas = document.createElement('canvas');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext('2d');
-    pdfContainer.appendChild(canvas);
-    await page.render({ canvasContext: ctx, viewport }).promise;
-  }
+  if (pdfObjectUrl) URL.revokeObjectURL(pdfObjectUrl);
+  pdfObjectUrl = URL.createObjectURL(new Blob([arrayBuffer], { type: 'application/pdf' }));
+
+  const viewer = document.createElement('iframe');
+  viewer.className = 'pdf-viewer';
+  viewer.title = 'Compiled PDF preview';
+  viewer.src = pdfObjectUrl;
+  pdfContainer.appendChild(viewer);
 }
 
 async function compile() {
@@ -518,10 +632,11 @@ async function compile() {
 
     if (res.ok && contentType.includes('application/pdf')) {
       const entry = res.headers.get('X-Compiled-Entry') || '';
+      const cached = res.headers.get('X-Compile-Cached') === 'true';
       const buf = await res.arrayBuffer();
       document.getElementById('pdf-placeholder')?.remove();
-      await renderPdf(buf);
-      setToolbar(`Compiled ${entry} successfully.`, 'ok');
+      renderPdf(buf);
+      setToolbar(cached ? `Loaded cached ${entry}.` : `Compiled ${entry} successfully.`, 'ok');
       hideLog();
     } else {
       const data = await res.json().catch(() => ({ error: `HTTP ${res.status}`, log: '' }));

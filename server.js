@@ -1,11 +1,13 @@
 'use strict';
 
 const express = require('express');
+const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs/promises');
 const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
+const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const COMPILE_TIMEOUT_MS = 120_000;
@@ -35,10 +37,119 @@ const TEXT_EXTENSIONS = new Set([
 const ONLY_CACHED = process.env.TECTONIC_ONLY_CACHED === '1';
 const compileWorkspaces = new Map();
 const compileLocks = new Map();
+const compileCache = new Map();
+const collaborationRooms = new Map();
+const COLLABORATOR_COLORS = ['#d6336c', '#1971c2', '#2f9e44', '#e67700', '#7048e8', '#0c8599', '#c2255c', '#5f3dc4'];
 
 const app = express();
 app.use(express.json({ limit: '3mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+const server = http.createServer(app);
+const collaborationServer = new WebSocketServer({ noServer: true, maxPayload: MAX_FILE_BYTES });
+
+function broadcastEdit(projectName, sender, message) {
+  broadcastRoomMessage(projectName, sender, message);
+}
+
+function broadcastRoomMessage(projectName, sender, message) {
+  const room = collaborationRooms.get(projectName);
+  if (!room) return;
+  const serialized = JSON.stringify(message);
+  for (const client of room) {
+    if (client !== sender && client.readyState === 1) client.send(serialized);
+  }
+}
+
+server.on('upgrade', (request, socket, head) => {
+  let projectName;
+  try {
+    const requestUrl = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+    const match = requestUrl.pathname.match(/^\/collaboration\/([^/]+)$/);
+    projectName = match && decodeURIComponent(match[1]);
+  } catch {
+    projectName = null;
+  }
+
+  if (!projectRootFor(projectName)) {
+    socket.destroy();
+    return;
+  }
+
+  collaborationServer.handleUpgrade(request, socket, head, (client) => {
+    collaborationServer.emit('connection', client, request, projectName);
+  });
+});
+
+collaborationServer.on('connection', (client, request, projectName) => {
+  let room = collaborationRooms.get(projectName);
+  if (!room) {
+    room = new Set();
+    collaborationRooms.set(projectName, room);
+  }
+  room.add(client);
+  client.collaboratorColor = COLLABORATOR_COLORS[(room.size - 1) % COLLABORATOR_COLORS.length];
+
+  client.send(JSON.stringify({ type: 'connected', color: client.collaboratorColor }));
+  client.on('message', async (raw) => {
+    let message;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (message.type === 'hello' && typeof message.senderId === 'string') {
+      client.collaboratorId = message.senderId;
+      broadcastRoomMessage(projectName, client, {
+        type: 'presence',
+        senderId: client.collaboratorId,
+        color: client.collaboratorColor,
+      });
+      return;
+    }
+    if (message.type === 'cursor' && typeof message.senderId === 'string'
+      && isTextEditable(message.path) && Number.isInteger(message.line)
+      && Number.isInteger(message.ch)) {
+      client.collaboratorId = message.senderId;
+      broadcastRoomMessage(projectName, client, {
+        type: 'cursor',
+        senderId: client.collaboratorId,
+        path: message.path,
+        line: message.line,
+        ch: message.ch,
+        color: client.collaboratorColor,
+      });
+      return;
+    }
+    if (message.type !== 'edit' || !isTextEditable(message.path) || typeof message.content !== 'string') return;
+    if (Buffer.byteLength(message.content, 'utf8') > MAX_FILE_BYTES) return;
+
+    const root = projectRootFor(projectName);
+    const abs = resolveSafePath(root, message.path);
+    if (!abs || !(await projectExists(root))) return;
+    try {
+      await fs.writeFile(abs, message.content, 'utf8');
+      broadcastEdit(projectName, client, {
+        type: 'edit',
+        path: message.path,
+        content: message.content,
+        senderId: message.senderId,
+      });
+    } catch {
+      // The next explicit save or reconnect will surface a filesystem error.
+    }
+  });
+
+  client.on('close', () => {
+    if (client.collaboratorId) {
+      broadcastRoomMessage(projectName, client, {
+        type: 'leave',
+        senderId: client.collaboratorId,
+      });
+    }
+    room.delete(client);
+    if (room.size === 0) collaborationRooms.delete(projectName);
+  });
+});
 
 // tectonic availability check (unchanged from before)
 function checkTectonicAvailable() {
@@ -395,6 +506,12 @@ app.post('/api/projects/:project/compile', async (req, res) => {
   let compileOutput;
   try {
     compileOutput = await withCompileLock(req.params.project, async () => {
+      const fingerprint = await getProjectFingerprint(root);
+      const cached = compileCache.get(req.params.project);
+      if (cached && cached.entry === entryRel && cached.fingerprint === fingerprint) {
+        return { cached: true, pdf: cached.pdf };
+      }
+
       const jobId = crypto.randomBytes(8).toString('hex');
       const tmpDir = await getCompileWorkspace(req.params.project, root, jobId);
       const args = [
@@ -407,6 +524,8 @@ app.post('/api/projects/:project/compile', async (req, res) => {
       if (ONLY_CACHED) args.push('--only-cached');
       args.push(path.join(tmpDir, entryRel));
       return {
+        cached: false,
+        fingerprint,
         tmpDir,
         pdfPath: path.join(tmpDir, `${entryBase}.pdf`),
         logPath: path.join(tmpDir, `${entryBase}.log`),
@@ -415,6 +534,13 @@ app.post('/api/projects/:project/compile', async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ error: `Server error: ${err.message}`, log: '', entry: entryRel });
+  }
+
+  if (compileOutput.cached) {
+    res.set('Content-Type', 'application/pdf');
+    res.set('X-Compiled-Entry', entryRel);
+    res.set('X-Compile-Cached', 'true');
+    return res.status(200).send(compileOutput.pdf);
   }
 
   const { tmpDir, pdfPath, logPath, result } = compileOutput;
@@ -451,6 +577,13 @@ app.post('/api/projects/:project/compile', async (req, res) => {
   }
 
   const pdf = await fs.readFile(pdfPath);
+  if (await getProjectFingerprint(root) === compileOutput.fingerprint) {
+    compileCache.set(req.params.project, {
+      entry: entryRel,
+      fingerprint: compileOutput.fingerprint,
+      pdf,
+    });
+  }
   res.set('Content-Type', 'application/pdf');
   res.set('X-Compiled-Entry', entryRel);
   return res.status(200).send(pdf);
@@ -499,6 +632,26 @@ async function getCompileWorkspace(projectName, projectRoot, jobId) {
   compileWorkspaces.set(projectName, workspace);
   await workspace.ready;
   return workspace.path;
+}
+
+async function getProjectFingerprint(projectRoot) {
+  const files = [];
+  async function collect(dirAbsPath) {
+    const entries = await fs.readdir(dirAbsPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === 'outputs') continue;
+      const abs = path.join(dirAbsPath, entry.name);
+      if (entry.isDirectory()) {
+        await collect(abs);
+      } else {
+        const stat = await fs.stat(abs);
+        files.push(`${path.relative(projectRoot, abs)}:${stat.size}:${stat.mtimeMs}`);
+      }
+    }
+  }
+  await collect(projectRoot);
+  files.sort();
+  return crypto.createHash('sha256').update(files.join('\n')).digest('hex');
 }
 
 async function publishCompileArtifacts(tmpDir, projectRoot) {
@@ -613,7 +766,7 @@ ensureProjectsRoot()
     console.error('Failed to set up projects/ directory:', err.message);
   })
   .finally(() => {
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`latex-cowrite listening on http://localhost:${PORT}`);
     });
   });

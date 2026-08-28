@@ -2,11 +2,12 @@
 
 Self-hosted collaborative LaTeX editor (Overleaf-style).
 
-This is **Phase 1**: a single-user editor with a working compile pipeline. Real-time multi-user sync using Yjs is planned for Phase 2.
+This is **Phase 1**: an anonymous collaborative editor with a working compile pipeline.
 
 * Multi-file **projects**, each with its own folder on disk under `projects/`
 * File tree on the left you can browse, open, and edit (CodeMirror), alongside a project picker and "+ New Project" / "+ New File" / "+ New Folder"
-* PDF preview (PDF.js) on the right
+* Selectable PDF preview in the browser's native PDF viewer on the right
+* Anonymous real-time editing for users in the same project
 * Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/) — compiles the whole project (so `\input`, `\include`, and other in-project references resolve correctly), not just a single file
 * Compile errors shown in a log panel
 * Each compile runs against a throwaway copy of the project in its own temporary directory, with a timeout
@@ -356,21 +357,15 @@ On failure (`4xx`/`5xx`):
 
 ## Roadmap
 
-### Phase 2
-
-Real-time multi-user editing using Yjs and `y-websocket`.
-
-The goal is to use CRDT-based synchronization so multiple users can edit the same LaTeX document at the same time.
-
 ### Future improvements
 
 * Async compilation with a job ID
 * Polling or WebSocket support for compile status
 * Live compilation log streaming
+* CRDT-based synchronization for conflict-free simultaneous edits
 * Compile concurrency limits for multi-user deployments (the current server
   serializes builds only within one project)
 * Stronger filesystem isolation
 * CPU and memory limits
 * Container-based compilation
 * Per-file "set as main" instead of always inferring `main.tex`
-* Uploading a project as a zip, and renaming/deleting files or folders from the UI

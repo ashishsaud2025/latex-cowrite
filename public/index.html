@@ -11,19 +11,17 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
 
-<!-- PDF.js for rendering the compiled PDF -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
 <header>
-  <h1>LaTeX Editor <span class="tag">Single-User(for now)</span></h1>
+  <h1>LaTeX Editor <span class="tag">live collaboration</span></h1>
   <div class="header-actions">
     <select id="project-select" title="Active project"></select>
     <button id="new-project-btn" title="Create a new project">+ Project</button>
     <span id="tectonic-status" class="status-pill status-unknown">checking tectonic…</span>
+    <span id="collaboration-status" class="status-pill status-unknown">connecting…</span>
     <button id="save-btn" disabled>Save</button>
     <button id="compile-btn">Compile</button>
   </div>

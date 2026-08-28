@@ -2,12 +2,13 @@
   "name": "latex-cowrite",
   "version": "0.1.0",
   "private": true,
-  "description": "Self-hosted collaborative LaTeX editor. Phase 1 MVP: single-user editor + server-side tectonic compile + PDF.js preview.",
+  "description": "Self-hosted collaborative LaTeX editor. Phase 1 MVP: single-user editor + server-side tectonic compile + selectable PDF preview.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "ws": "^8.21.3"
   }
 }
