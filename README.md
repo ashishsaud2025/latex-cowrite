@@ -230,9 +230,22 @@ The following protections are **not** included in Phase 1:
 
 For a real multi-user deployment, compilation should run inside a container or another isolated environment. Docker with `--network none` and resource limits, gVisor, or firejail are possible options.
 
-## Known limitation: compile time on large documents
+## Compile performance for large documents
 
-LaTeX compilation is not incremental. Tectonic rebuilds the entire document on every compilation.
+Tectonic still processes the entire document on every compilation, but the app
+now keeps a separate cached build workspace for each project. This preserves
+`.aux`, `.toc`, bibliography, and other intermediate files between builds while
+keeping generated files outside the project directory. Builds for the same
+project are serialized so concurrent requests cannot corrupt that workspace.
+
+After each compile, generated artifacts are copied into that project's
+`outputs/` folder. This includes the PDF, log, auxiliary files, and other
+Tectonic intermediates. The `outputs/` folder is excluded from the compiler's
+source copy and is ignored by the repository's existing `projects/` rule.
+
+The server allows up to 120 seconds for a compile. The first build can still be
+slow because Tectonic may download packages; later builds reuse the local
+Tectonic package cache.
 
 Large or complex documents can take significantly longer to compile. This is especially common with:
 
@@ -242,7 +255,14 @@ Large or complex documents can take significantly longer to compile. This is esp
 * Documents with many images
 * Complex packages
 
-The current implementation uses a synchronous request with a hard timeout.
+The current implementation uses a synchronous request with a 120-second hard
+timeout. The PDF response is not returned until compilation completes.
+
+For faster drafting, keep expensive TikZ/PGFPlots figures and large image
+directories out of the document while working, and use a temporary lightweight
+entry file that inputs only the chapter being edited. Restore `main.tex` for
+the final full-report build. The app does not yet provide a draft/partial-build
+mode automatically.
 
 An asynchronous job queue with polling or WebSocket support is planned for a future phase. This will allow longer compilations and provide live compilation logs.
 
@@ -347,7 +367,8 @@ The goal is to use CRDT-based synchronization so multiple users can edit the sam
 * Async compilation with a job ID
 * Polling or WebSocket support for compile status
 * Live compilation log streaming
-* Compile concurrency limits for multi-user deployments
+* Compile concurrency limits for multi-user deployments (the current server
+  serializes builds only within one project)
 * Stronger filesystem isolation
 * CPU and memory limits
 * Container-based compilation
