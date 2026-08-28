@@ -206,6 +206,38 @@ body.is-resizing .resize-handle::after {
 .tree-row.non-editable { color: #9aa0a8; }
 
 .tree-row .icon { width: 14px; text-align: center; flex-shrink: 0; }
+.tree-row > span:not(.icon):not(.tree-row-actions) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-row-actions {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.tree-row:hover .tree-row-actions,
+.tree-row:focus-within .tree-row-actions {
+  opacity: 1;
+}
+.tree-action {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  color: #56606f;
+  background: transparent;
+  font-size: 12px;
+  line-height: 20px;
+  font-weight: 700;
+}
+.tree-action:hover,
+.tree-action:focus-visible {
+  background: #d8dce3;
+  color: var(--accent-dark);
+}
 .tree-children { margin-left: 14px; }
 
 /* --- Editor --- */

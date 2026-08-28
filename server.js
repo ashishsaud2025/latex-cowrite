@@ -8,7 +8,7 @@ const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
-const COMPILE_TIMEOUT_MS = 10_000;
+const COMPILE_TIMEOUT_MS = 120_000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write
 const MAX_PROJECT_BYTES = 25 * 1024 * 1024;    // cap for total project size when compiling
 
@@ -33,6 +33,8 @@ const TEXT_EXTENSIONS = new Set([
 // stops tectonic itself from trying. Off by default because most fresh
 // installs need one online compile to warm the bundle cache.
 const ONLY_CACHED = process.env.TECTONIC_ONLY_CACHED === '1';
+const compileWorkspaces = new Map();
+const compileLocks = new Map();
 
 const app = express();
 app.use(express.json({ limit: '3mb' }));
@@ -297,6 +299,53 @@ app.post('/api/projects/:project/entries', async (req, res) => {
   }
 });
 
+// PATCH /api/projects/:project/entries -> rename a file or folder
+// Body: { path: string, newPath: string }
+app.patch('/api/projects/:project/entries', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+  const { path: oldRelPath, newPath } = req.body || {};
+  const oldAbs = resolveSafePath(root, oldRelPath);
+  const newAbs = resolveSafePath(root, newPath);
+  if (!oldAbs || !newAbs || oldAbs === root || newAbs === root) {
+    return res.status(400).json({ error: 'Invalid path.' });
+  }
+  try {
+    const oldStat = await fs.stat(oldAbs);
+    if (await fs.access(newAbs).then(() => true).catch(() => false)) {
+      return res.status(409).json({ error: 'That path already exists.' });
+    }
+    await fs.mkdir(path.dirname(newAbs), { recursive: true });
+    await fs.rename(oldAbs, newAbs);
+    res.json({ ok: true, type: oldStat.isDirectory() ? 'dir' : 'file' });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'Entry not found.' });
+    res.status(500).json({ error: `Could not rename entry: ${err.message}` });
+  }
+});
+
+// DELETE /api/projects/:project/entries -> delete a file or folder
+// Body: { path: string }
+app.delete('/api/projects/:project/entries', async (req, res) => {
+  const root = projectRootFor(req.params.project);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+  const relPath = req.body && req.body.path;
+  const abs = resolveSafePath(root, relPath);
+  if (!abs || abs === root) return res.status(400).json({ error: 'Invalid path.' });
+  try {
+    const stat = await fs.stat(abs);
+    await fs.rm(abs, { recursive: stat.isDirectory(), force: false });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'Entry not found.' });
+    res.status(500).json({ error: `Could not delete entry: ${err.message}` });
+  }
+});
+
 // POST /api/projects/:project/compile
 // Compiles the project's entry file (main.tex if present, else the first
 // top-level .tex file). Success: 200 application/pdf. Failure: JSON
@@ -339,70 +388,133 @@ app.post('/api/projects/:project/compile', async (req, res) => {
     });
   }
 
-  // Compile from a throwaway copy of the whole project, not the project
-  // directory itself -- this is our sandbox boundary (same as before), and
-  // it also keeps tectonic's build byproducts (.aux, .log, the .pdf) out
-  // of the user's actual project folder.
-  const jobId = crypto.randomBytes(8).toString('hex');
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `texcomp-${jobId}-`));
-
+  // Compile from a cached throwaway copy of the whole project, not the
+  // project directory itself. Keeping this sandbox between builds lets
+  // Tectonic reuse .aux, .toc, bibliography, and other intermediates.
   const entryBase = path.basename(entryRel, '.tex');
-  const pdfPath = path.join(tmpDir, `${entryBase}.pdf`);
-  const logPath = path.join(tmpDir, `${entryBase}.log`);
-
+  let compileOutput;
   try {
-    await fs.cp(root, tmpDir, { recursive: true });
-
-    const args = [
-      '--untrusted',
-      '-o', tmpDir,
-      '--keep-logs',
-      '--reruns', '1',
-    ];
-    if (ONLY_CACHED) args.push('--only-cached');
-    args.push(path.join(tmpDir, entryRel));
-
-    const result = await runTectonic(args, tmpDir);
-
-    if (result.timedOut) {
-      const log = await readIfExists(logPath);
-      return res.status(504).json({
-        error: `Compilation timed out after ${COMPILE_TIMEOUT_MS / 1000}s.`,
-        log: combineLog(result.stdout, result.stderr, log),
-        entry: entryRel,
-      });
-    }
-    if (result.code !== 0) {
-      const log = await readIfExists(logPath);
-      return res.status(422).json({
-        error: `tectonic exited with code ${result.code}.`,
-        log: combineLog(result.stdout, result.stderr, log),
-        entry: entryRel,
-      });
-    }
-
-    const pdfExists = await fs.access(pdfPath).then(() => true).catch(() => false);
-    if (!pdfExists) {
-      const log = await readIfExists(logPath);
-      return res.status(422).json({
-        error: 'tectonic reported success but produced no PDF.',
-        log: combineLog(result.stdout, result.stderr, log),
-        entry: entryRel,
-      });
-    }
-
-    const pdf = await fs.readFile(pdfPath);
-    res.set('Content-Type', 'application/pdf');
-    res.set('X-Compiled-Entry', entryRel);
-    return res.status(200).send(pdf);
+    compileOutput = await withCompileLock(req.params.project, async () => {
+      const jobId = crypto.randomBytes(8).toString('hex');
+      const tmpDir = await getCompileWorkspace(req.params.project, root, jobId);
+      const args = [
+        '--untrusted',
+        '-o', tmpDir,
+        '--keep-logs',
+        '--keep-intermediates',
+        '--reruns', '1',
+      ];
+      if (ONLY_CACHED) args.push('--only-cached');
+      args.push(path.join(tmpDir, entryRel));
+      return {
+        tmpDir,
+        pdfPath: path.join(tmpDir, `${entryBase}.pdf`),
+        logPath: path.join(tmpDir, `${entryBase}.log`),
+        result: await runTectonic(args, tmpDir),
+      };
+    });
   } catch (err) {
     return res.status(500).json({ error: `Server error: ${err.message}`, log: '', entry: entryRel });
-  } finally {
-    fs.rm(tmpDir, { recursive: true, force: true }).catch((err) => {
-      console.error(`Failed to remove temp dir ${tmpDir}:`, err.message);
+  }
+
+  const { tmpDir, pdfPath, logPath, result } = compileOutput;
+  try {
+    await publishCompileArtifacts(tmpDir, root);
+  } catch (err) {
+    return res.status(500).json({ error: `Could not publish compile artifacts: ${err.message}`, log: '', entry: entryRel });
+  }
+  if (result.timedOut) {
+    const log = await readIfExists(logPath);
+    return res.status(504).json({
+      error: `Compilation timed out after ${COMPILE_TIMEOUT_MS / 1000}s.`,
+      log: combineLog(result.stdout, result.stderr, log),
+      entry: entryRel,
     });
   }
+  if (result.code !== 0) {
+    const log = await readIfExists(logPath);
+    return res.status(422).json({
+      error: `tectonic exited with code ${result.code}.`,
+      log: combineLog(result.stdout, result.stderr, log),
+      entry: entryRel,
+    });
+  }
+
+  const pdfExists = await fs.access(pdfPath).then(() => true).catch(() => false);
+  if (!pdfExists) {
+    const log = await readIfExists(logPath);
+    return res.status(422).json({
+      error: 'tectonic reported success but produced no PDF.',
+      log: combineLog(result.stdout, result.stderr, log),
+      entry: entryRel,
+    });
+  }
+
+  const pdf = await fs.readFile(pdfPath);
+  res.set('Content-Type', 'application/pdf');
+  res.set('X-Compiled-Entry', entryRel);
+  return res.status(200).send(pdf);
 });
+
+async function withCompileLock(projectName, operation) {
+  const previous = compileLocks.get(projectName) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  compileLocks.set(projectName, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (compileLocks.get(projectName) === current) compileLocks.delete(projectName);
+  }
+}
+
+async function getCompileWorkspace(projectName, projectRoot, jobId) {
+  const previous = compileWorkspaces.get(projectName);
+  if (previous) {
+    await previous.ready;
+    await fs.cp(projectRoot, previous.path, {
+      recursive: true,
+      force: true,
+      filter: (source) => {
+        const relative = path.relative(projectRoot, source);
+        return relative === '' || !relative.split(path.sep).includes('outputs');
+      },
+    });
+    return previous.path;
+  }
+
+  const workspace = {
+    path: await fs.mkdtemp(path.join(os.tmpdir(), `texcomp-${projectName}-${jobId}-`)),
+  };
+  workspace.ready = fs.cp(projectRoot, workspace.path, {
+    recursive: true,
+    force: true,
+    filter: (source) => {
+      const relative = path.relative(projectRoot, source);
+      return relative === '' || !relative.split(path.sep).includes('outputs');
+    },
+  });
+  compileWorkspaces.set(projectName, workspace);
+  await workspace.ready;
+  return workspace.path;
+}
+
+async function publishCompileArtifacts(tmpDir, projectRoot) {
+  const outputDir = path.join(projectRoot, 'outputs');
+  await fs.rm(outputDir, { recursive: true, force: true });
+  await fs.mkdir(outputDir, { recursive: true });
+  const entries = await fs.readdir(tmpDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.name === 'outputs') continue;
+    const sourcePath = path.join(projectRoot, entry.name);
+    const sourceExists = await fs.access(sourcePath).then(() => true).catch(() => false);
+    if (sourceExists) continue;
+    await fs.cp(path.join(tmpDir, entry.name), path.join(outputDir, entry.name), { recursive: true });
+  }
+}
 
 async function findEntryFile(root) {
   const entries = await fs.readdir(root, { withFileTypes: true });

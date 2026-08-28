@@ -128,6 +128,7 @@ const cm = CodeMirror.fromTextArea(document.getElementById('source'), {
 // State
 let currentProject = null;
 let currentFile = null; // { path, editable }
+let expandedFolders = new Set();
 let dirty = false;
 let suppressChangeEvents = false;
 
@@ -185,6 +186,7 @@ async function loadProjects(selectName) {
 async function switchProject(name) {
   currentProject = name;
   currentFile = null;
+  expandedFolders = new Set();
   setDirty(false);
   activeFileNameEl.textContent = 'No file open';
   suppressChangeEvents = true;
@@ -251,22 +253,62 @@ function renderNode(node) {
   label.textContent = node.name;
   row.appendChild(label);
 
+  const actions = document.createElement('span');
+  actions.className = 'tree-row-actions';
+  if (node.type === 'dir') {
+    const addFileButton = createTreeActionButton('+', `Create file in ${node.path}`);
+    addFileButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      createEntry('file', node.path);
+    });
+    actions.appendChild(addFileButton);
+  }
+  const renameButton = createTreeActionButton('R', `Rename ${node.name}`);
+  renameButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    renameEntry(node);
+  });
+  actions.appendChild(renameButton);
+  const deleteButton = createTreeActionButton('x', `Delete ${node.name}`);
+  deleteButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    deleteEntry(node);
+  });
+  actions.appendChild(deleteButton);
+  row.appendChild(actions);
+
   container.appendChild(row);
 
   if (node.type === 'dir') {
     const childrenWrap = renderNodeChildren(node.children);
     childrenWrap.className = 'tree-children';
+    const expanded = expandedFolders.has(node.path);
+    childrenWrap.style.display = expanded ? '' : 'none';
+    icon.textContent = expanded ? '📂' : '📁';
     container.appendChild(childrenWrap);
 
     row.addEventListener('click', () => {
-      childrenWrap.style.display = childrenWrap.style.display === 'none' ? '' : 'none';
-      icon.textContent = childrenWrap.style.display === 'none' ? '📁' : '📂';
+      const isExpanded = childrenWrap.style.display !== 'none';
+      childrenWrap.style.display = isExpanded ? 'none' : '';
+      icon.textContent = isExpanded ? '📁' : '📂';
+      if (isExpanded) expandedFolders.delete(node.path);
+      else expandedFolders.add(node.path);
     });
   } else {
     row.addEventListener('click', () => openFile(node));
   }
 
   return container;
+}
+
+function createTreeActionButton(text, label) {
+  const button = document.createElement('button');
+  button.className = 'tree-action';
+  button.type = 'button';
+  button.textContent = text;
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  return button;
 }
 
 // Open / save file
@@ -337,11 +379,15 @@ document.addEventListener('keydown', (e) => {
 });
 
 // New file / folder
-async function createEntry(type) {
+async function createEntry(type, parentPath = '') {
   if (!currentProject) return;
   const label = type === 'dir' ? 'folder' : 'file';
-  const relPath = prompt(`Path for new ${label} (relative to project root, e.g. "sections/new.tex"):`);
-  if (!relPath) return;
+  const promptText = parentPath
+    ? `Name for new ${label} inside "${parentPath}":`
+    : `Path for new ${label} (relative to project root, e.g. "sections/new.tex"): `;
+  const name = prompt(promptText);
+  if (!name) return;
+  const relPath = parentPath ? `${parentPath}/${name}` : name;
 
   const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/entries`, {
     method: 'POST',
@@ -353,10 +399,60 @@ async function createEntry(type) {
     alert(data.error || `Could not create ${label}.`);
     return;
   }
+  if (parentPath) expandedFolders.add(parentPath);
   await loadTree();
   if (type === 'file' && isTextEditableClientSide(relPath)) {
     openFile({ path: relPath, editable: true, name: relPath.split('/').pop() });
   }
+}
+
+async function renameEntry(node) {
+  const nextName = prompt(`Rename "${node.name}" to:`, node.name);
+  if (!nextName || nextName === node.name) return;
+  const parentPath = node.path.includes('/') ? node.path.slice(0, node.path.lastIndexOf('/')) : '';
+  const newPath = parentPath ? `${parentPath}/${nextName}` : nextName;
+  const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/entries`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: node.path, newPath }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error || 'Could not rename entry.');
+    return;
+  }
+  if (currentFile && (currentFile.path === node.path || currentFile.path.startsWith(`${node.path}/`))) {
+    currentFile.path = currentFile.path === node.path
+      ? newPath
+      : `${newPath}${currentFile.path.slice(node.path.length)}`;
+    activeFileNameEl.textContent = currentFile.path;
+  }
+  await loadTree();
+}
+
+async function deleteEntry(node) {
+  const suffix = node.type === 'dir' ? ' and everything inside it' : '';
+  if (!confirm(`Delete "${node.path}"${suffix}?`)) return;
+  const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/entries`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: node.path }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error || 'Could not delete entry.');
+    return;
+  }
+  if (currentFile && (currentFile.path === node.path || currentFile.path.startsWith(`${node.path}/`))) {
+    currentFile = null;
+    activeFileNameEl.textContent = 'No file open';
+    suppressChangeEvents = true;
+    cm.setValue('');
+    suppressChangeEvents = false;
+    cm.setOption('readOnly', true);
+    setDirty(false);
+  }
+  await loadTree();
 }
 
 function isTextEditableClientSide(relPath) {
