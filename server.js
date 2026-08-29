@@ -47,6 +47,32 @@ app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app);
 const collaborationServer = new WebSocketServer({ noServer: true, maxPayload: MAX_FILE_BYTES });
 
+// Heartbeat: ping every collaboration client periodically. This keeps the
+// underlying connection active across NAT/relay paths (e.g. a Tailscale
+// DERP relay) that silently drop idle connections after their own timeout,
+// which otherwise shows up as frequent, spurious "reconnecting" flicker in
+// the UI. A client is only terminated after missing several pings in a row,
+// so a single slow relay round-trip doesn't tear the connection down.
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_MISS_LIMIT = 3; // ~45s grace before a truly dead peer is dropped
+
+const heartbeatTimer = setInterval(() => {
+  for (const client of collaborationServer.clients) {
+    if ((client.missedHeartbeats || 0) >= HEARTBEAT_MISS_LIMIT) {
+      client.terminate();
+      continue;
+    }
+    client.missedHeartbeats = (client.missedHeartbeats || 0) + 1;
+    try {
+      client.ping();
+    } catch {
+      // Socket already closing; the close handler will clean it up.
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
+collaborationServer.on('close', () => clearInterval(heartbeatTimer));
+
 function broadcastEdit(projectName, sender, message) {
   broadcastRoomMessage(projectName, sender, message);
 }
@@ -88,6 +114,10 @@ collaborationServer.on('connection', (client, request, projectName) => {
   }
   room.add(client);
   client.collaboratorColor = COLLABORATOR_COLORS[(room.size - 1) % COLLABORATOR_COLORS.length];
+  client.missedHeartbeats = 0;
+  client.on('pong', () => {
+    client.missedHeartbeats = 0;
+  });
 
   client.send(JSON.stringify({ type: 'connected', color: client.collaboratorColor }));
   client.on('message', async (raw) => {

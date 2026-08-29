@@ -132,7 +132,22 @@ let dirty = false;
 let suppressChangeEvents = false;
 let collaborationSocket = null;
 let collaborationReconnectTimer = null;
-const collaborationSenderId = crypto.randomUUID();
+let collaborationReconnectDelay = 1000;
+let collaborationStatusGraceTimer = null;
+function generateUUID() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
+  }
+  // Fallback for insecure contexts (plain http on a non-localhost address),
+  // where crypto.randomUUID is unavailable.
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+const collaborationSenderId = generateUUID();
 let collaborationEditTimer = null;
 let collaborationColor = '#d6336c';
 const remoteCursors = new Map();
@@ -190,7 +205,11 @@ function connectCollaboration() {
     `${protocol}//${location.host}/collaboration/${encodeURIComponent(currentProject)}`
   );
   collaborationSocket.addEventListener('open', () => {
+    // A reconnect succeeded before the grace timer fired, so cancel the
+    // pending "reconnecting…" status change and reset the backoff.
+    clearTimeout(collaborationStatusGraceTimer);
     setCollaborationStatus('collaborating', 'ok');
+    collaborationReconnectDelay = 1000;
   });
   collaborationSocket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
@@ -219,9 +238,18 @@ function connectCollaboration() {
   });
   collaborationSocket.addEventListener('close', () => {
     clearRemoteCursors();
-    setCollaborationStatus('reconnecting…', 'unknown');
+    // Wait briefly before showing "reconnecting…" — a single dropped ping
+    // over a relayed connection is often followed by an instant successful
+    // reconnect, and flashing the status for that is just noise.
+    clearTimeout(collaborationStatusGraceTimer);
+    collaborationStatusGraceTimer = setTimeout(() => {
+      setCollaborationStatus('reconnecting…', 'unknown');
+    }, 400);
     clearTimeout(collaborationReconnectTimer);
-    collaborationReconnectTimer = setTimeout(connectCollaboration, 1000);
+    collaborationReconnectTimer = setTimeout(connectCollaboration, collaborationReconnectDelay);
+    // Back off exponentially (capped at 10s) so a flaky relay path doesn't
+    // hammer the server with reconnect attempts once per second.
+    collaborationReconnectDelay = Math.min(collaborationReconnectDelay * 2, 10_000);
   });
   collaborationSocket.addEventListener('error', () => {
     setCollaborationStatus('offline', 'missing');
@@ -238,7 +266,7 @@ function queueCollaborationEdit() {
       content: cm.getValue(),
       senderId: collaborationSenderId,
     }));
-  }, 250);
+  }, 100);
 }
 
 cm.on('change', () => {
