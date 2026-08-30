@@ -5,13 +5,19 @@ const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs/promises');
+const fsSync = require('fs'); // used only to seed a new room's content synchronously, see below
 const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+// Server-side sync + awareness building blocks for Yjs's WebSocket protocol.
+// y-websocket is pinned to 1.5.x specifically because this subpath (server
+// utilities) was split out of the package in 2.x/3.x -- newer versions only
+// ship the client-side WebsocketProvider.
+const { setupWSConnection, getYDoc, docs: yDocs } = require('y-websocket/bin/utils');
 
 const PORT = process.env.PORT || 3000;
 const COMPILE_TIMEOUT_MS = 120_000;
-const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write
+const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write; also used as the collaboration WebSocket's maxPayload 
 const MAX_PROJECT_BYTES = 25 * 1024 * 1024;    // cap for total project size when compiling
 
 // Where all projects live on disk -- a folder at the same level as
@@ -38,8 +44,6 @@ const ONLY_CACHED = process.env.TECTONIC_ONLY_CACHED === '1';
 const compileWorkspaces = new Map();
 const compileLocks = new Map();
 const compileCache = new Map();
-const collaborationRooms = new Map();
-const COLLABORATOR_COLORS = ['#d6336c', '#1971c2', '#2f9e44', '#e67700', '#7048e8', '#0c8599', '#c2255c', '#5f3dc4'];
 
 const app = express();
 app.use(express.json({ limit: '3mb' }));
@@ -47,138 +51,90 @@ app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app);
 const collaborationServer = new WebSocketServer({ noServer: true, maxPayload: MAX_FILE_BYTES });
 
-// Heartbeat: ping every collaboration client periodically. This keeps the
-// underlying connection active across NAT/relay paths (e.g. a Tailscale
-// DERP relay) that silently drop idle connections after their own timeout,
-// which otherwise shows up as frequent, spurious "reconnecting" flicker in
-// the UI. A client is only terminated after missing several pings in a row,
-// so a single slow relay round-trip doesn't tear the connection down.
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const HEARTBEAT_MISS_LIMIT = 3; // ~45s grace before a truly dead peer is dropped
-
-const heartbeatTimer = setInterval(() => {
-  for (const client of collaborationServer.clients) {
-    if ((client.missedHeartbeats || 0) >= HEARTBEAT_MISS_LIMIT) {
-      client.terminate();
-      continue;
-    }
-    client.missedHeartbeats = (client.missedHeartbeats || 0) + 1;
-    try {
-      client.ping();
-    } catch {
-      // Socket already closing; the close handler will clean it up.
-    }
-  }
-}, HEARTBEAT_INTERVAL_MS);
-
-collaborationServer.on('close', () => clearInterval(heartbeatTimer));
-
-function broadcastEdit(projectName, sender, message) {
-  broadcastRoomMessage(projectName, sender, message);
+// Real-time collaborative editing with Yjs.
+// Each file has its own Y.Doc, keyed by `${projectName}::${filePath}`,
+// with a Y.Text named "content". This file wires up the server side of
+// Yjs's sync + awareness protocol (via y-websocket's utilities) 
+function roomKeyFor(projectName, filePath) {
+  return `${projectName}::${filePath}`;
 }
 
-function broadcastRoomMessage(projectName, sender, message) {
-  const room = collaborationRooms.get(projectName);
-  if (!room) return;
-  const serialized = JSON.stringify(message);
-  for (const client of room) {
-    if (client !== sender && client.readyState === 1) client.send(serialized);
-  }
+// Debounce delay before persisting the room's content to disk.
+// Yjs updates are sent to peers immediately.
+const PERSIST_DEBOUNCE_MS = 500;
+const persistTimers = new Map(); // roomKey -> Timeout
+
+function schedulePersist(roomKey, projectName, filePath) {
+  clearTimeout(persistTimers.get(roomKey));
+  persistTimers.set(roomKey, setTimeout(async () => {
+    persistTimers.delete(roomKey);
+    const doc = yDocs.get(roomKey);
+    if (!doc) return; // room was torn down before this fired
+    const root = projectRootFor(projectName);
+    const abs = root && resolveSafePath(root, filePath);
+    if (!abs) return;
+    try {
+      // The project or the file itself may have been deleted/renamed out
+      // from under an active room hence, skip the write rather than recreate it.
+      if (!(await projectExists(root))) return;
+      await fs.writeFile(abs, doc.getText('content').toString(), 'utf8');
+    } catch {
+      // The next edit (or an explicit Save) will retry.
+    }
+  }, PERSIST_DEBOUNCE_MS));
 }
 
 server.on('upgrade', (request, socket, head) => {
   let projectName;
+  let filePath;
   try {
     const requestUrl = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
-    const match = requestUrl.pathname.match(/^\/collaboration\/([^/]+)$/);
+    const match = requestUrl.pathname.match(/^\/collaboration\/([^/]+)\/([^/]+)$/);
     projectName = match && decodeURIComponent(match[1]);
+    filePath = match && decodeURIComponent(match[2]);
   } catch {
     projectName = null;
+    filePath = null;
   }
 
-  if (!projectRootFor(projectName)) {
+  const root = projectRootFor(projectName);
+  if (!root || !filePath || !isTextEditable(filePath) || !resolveSafePath(root, filePath)) {
     socket.destroy();
     return;
   }
 
   collaborationServer.handleUpgrade(request, socket, head, (client) => {
-    collaborationServer.emit('connection', client, request, projectName);
+    collaborationServer.emit('connection', client, request, { projectName, filePath });
   });
 });
 
-collaborationServer.on('connection', (client, request, projectName) => {
-  let room = collaborationRooms.get(projectName);
-  if (!room) {
-    room = new Set();
-    collaborationRooms.set(projectName, room);
-  }
-  room.add(client);
-  client.collaboratorColor = COLLABORATOR_COLORS[(room.size - 1) % COLLABORATOR_COLORS.length];
-  client.missedHeartbeats = 0;
-  client.on('pong', () => {
-    client.missedHeartbeats = 0;
-  });
+collaborationServer.on('connection', (client, request, { projectName, filePath }) => {
+  const roomKey = roomKeyFor(projectName, filePath);
+  const isNewRoom = !yDocs.has(roomKey);
+// getYDoc registers new docs synchronously, so concurrent connections
+// correctly skip reseeding and duplicate persistence listeners.
+  const doc = getYDoc(roomKey);
 
-  client.send(JSON.stringify({ type: 'connected', color: client.collaboratorColor }));
-  client.on('message', async (raw) => {
-    let message;
-    try {
-      message = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-    if (message.type === 'hello' && typeof message.senderId === 'string') {
-      client.collaboratorId = message.senderId;
-      broadcastRoomMessage(projectName, client, {
-        type: 'presence',
-        senderId: client.collaboratorId,
-        color: client.collaboratorColor,
-      });
-      return;
-    }
-    if (message.type === 'cursor' && typeof message.senderId === 'string'
-      && isTextEditable(message.path) && Number.isInteger(message.line)
-      && Number.isInteger(message.ch)) {
-      client.collaboratorId = message.senderId;
-      broadcastRoomMessage(projectName, client, {
-        type: 'cursor',
-        senderId: client.collaboratorId,
-        path: message.path,
-        line: message.line,
-        ch: message.ch,
-        color: client.collaboratorColor,
-      });
-      return;
-    }
-    if (message.type !== 'edit' || !isTextEditable(message.path) || typeof message.content !== 'string') return;
-    if (Buffer.byteLength(message.content, 'utf8') > MAX_FILE_BYTES) return;
-
+  if (isNewRoom) {
+    // Seed the Y.Text from disk only when the room is first created.
+    // This must happen synchronously before setupWSConnection so the
+    // initial client sync message is not missed.
     const root = projectRootFor(projectName);
-    const abs = resolveSafePath(root, message.path);
-    if (!abs || !(await projectExists(root))) return;
+    const abs = resolveSafePath(root, filePath);
+    let initialContent = '';
     try {
-      await fs.writeFile(abs, message.content, 'utf8');
-      broadcastEdit(projectName, client, {
-        type: 'edit',
-        path: message.path,
-        content: message.content,
-        senderId: message.senderId,
-      });
+      initialContent = fsSync.readFileSync(abs, 'utf8');
     } catch {
-      // The next explicit save or reconnect will surface a filesystem error.
+      // File doesn't exist yet (e.g. a brand-new file); start empty.
     }
-  });
+    const ytext = doc.getText('content');
+    if (ytext.length === 0 && initialContent) {
+      ytext.insert(0, initialContent);
+    }
+    doc.on('update', () => schedulePersist(roomKey, projectName, filePath));
+  }
 
-  client.on('close', () => {
-    if (client.collaboratorId) {
-      broadcastRoomMessage(projectName, client, {
-        type: 'leave',
-        senderId: client.collaboratorId,
-      });
-    }
-    room.delete(client);
-    if (room.size === 0) collaborationRooms.delete(projectName);
-  });
+  setupWSConnection(client, request, { docName: roomKey });
 });
 
 // tectonic availability check (unchanged from before)
