@@ -5,10 +5,21 @@
   "description": "Self-hosted collaborative LaTeX editor. Phase 1 MVP: single-user editor + server-side tectonic compile + selectable PDF preview.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build": "node build-collab-bundle.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.21.3"
+    "ws": "^8.21.3",
+    "y-codemirror": "^3.0.1",
+    "y-protocols": "^1.0.7",
+    "y-websocket": "^1.5.4",
+    "yjs": "^13.6.32"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }
