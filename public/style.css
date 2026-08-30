@@ -272,7 +272,11 @@ body.is-resizing .resize-handle::after {
   font-family: "SF Mono", Menlo, Consolas, monospace;
 }
 
-.remote-cursor {
+/*
+Remote cursors rendered by y-codemirror using each peer's Awareness state.
+Uses the same thin colored line and name label as before.
+*/
+.remote-caret {
   display: inline-block;
   position: relative;
   height: 1.25em;
@@ -281,7 +285,7 @@ body.is-resizing .resize-handle::after {
   vertical-align: text-bottom;
   pointer-events: none;
 }
-.remote-cursor-label {
+.remote-caret > div {
   position: absolute;
   left: -2px;
   bottom: 100%;
@@ -290,6 +294,17 @@ body.is-resizing .resize-handle::after {
   font: 10px/1.2 sans-serif;
   white-space: nowrap;
   pointer-events: none;
+  z-index: 3;
+}
+/* y-codemirror adds this ~2s after a caret appears, to fade the name label
+   out until the collaborator moves their cursor again. */
+.remote-caret.hide-name > div {
+  opacity: 0;
+  transition: opacity 0.3s ease-in-out;
+}
+.remote-caret:hover > div {
+  opacity: 1;
+  transition-delay: 0s;
 }
 
 /* --- Preview --- */
