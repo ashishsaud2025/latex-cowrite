@@ -1,8 +1,6 @@
 'use strict';
 
-// ---------------------------------------------------------------------------
 // DOM refs
-// ---------------------------------------------------------------------------
 const projectSelect = document.getElementById('project-select');
 const newProjectBtn = document.getElementById('new-project-btn');
 const treeContainer = document.getElementById('tree-container');
@@ -130,154 +128,85 @@ let currentFile = null; // { path, editable }
 let expandedFolders = new Set();
 let dirty = false;
 let suppressChangeEvents = false;
-let collaborationSocket = null;
-let collaborationReconnectTimer = null;
-let collaborationReconnectDelay = 1000;
-let collaborationStatusGraceTimer = null;
-function generateUUID() {
-  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-    return window.crypto.randomUUID();
-  }
-  // Fallback for insecure contexts (plain http on a non-localhost address),
-  // where crypto.randomUUID is unavailable.
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
 
-const collaborationSenderId = generateUUID();
-let collaborationEditTimer = null;
-let collaborationColor = '#d6336c';
-const remoteCursors = new Map();
+// Real-time collaboration (Yjs)
+// Loaded from the pre-bundled public/collab-bundle.js as window.Collab.
+const { Y, WebsocketProvider, CodemirrorBinding } = window.Collab;
+
+// Same collaborator color palette as before; colors are now chosen client-side
+// from each tab's Yjs client ID instead of being assigned by the server.
+const COLLABORATOR_COLORS = ['#d6336c', '#1971c2', '#2f9e44', '#e67700', '#7048e8', '#0c8599', '#c2255c', '#5f3dc4'];
+
+// Short cosmetic label shown next to remote cursors.
+const collaboratorLabel = Math.random().toString(36).slice(2, 8);
+
+// Yjs state for the currently open file; only one set exists at a time.
+let currentYDoc = null;
+let currentProvider = null;
+let currentBinding = null;
 
 function setCollaborationStatus(text, kind = 'unknown') {
   collaborationStatus.textContent = text;
   collaborationStatus.className = `status-pill status-${kind}`;
 }
 
-function clearRemoteCursors() {
-  for (const marker of remoteCursors.values()) marker.clear();
-  remoteCursors.clear();
+// Clean up the current Yjs document, binding, and WebSocket connection.
+function teardownCollaboration() {
+  if (currentBinding) {
+    currentBinding.destroy();
+    currentBinding = null;
+  }
+
+  if (currentProvider) {
+    currentProvider.destroy(); // Also closes the underlying WebSocket.
+    currentProvider = null;
+  }
+
+  if (currentYDoc) {
+    currentYDoc.destroy();
+    currentYDoc = null;
+  }
 }
 
-function sendCollaborationCursor() {
-  if (!collaborationSocket || collaborationSocket.readyState !== WebSocket.OPEN
-    || !currentFile || !currentFile.editable) return;
-  const cursor = cm.getCursor();
-  collaborationSocket.send(JSON.stringify({
-    type: 'cursor',
-    senderId: collaborationSenderId,
-    path: currentFile.path,
-    line: cursor.line,
-    ch: cursor.ch,
-  }));
-}
+// Open real-time collaboration for a file using a dedicated Yjs room.
+// The room matches the server's project/file key.
+function openCollaboration(projectName, filePath) {
+  teardownCollaboration();
 
-function renderRemoteCursor(message) {
-  if (message.senderId === collaborationSenderId || !currentFile
-    || currentFile.path !== message.path) return;
-  const previous = remoteCursors.get(message.senderId);
-  if (previous) previous.clear();
-
-  const cursorElement = document.createElement('span');
-  cursorElement.className = 'remote-cursor';
-  cursorElement.style.borderColor = message.color;
-  const label = document.createElement('span');
-  label.className = 'remote-cursor-label';
-  label.textContent = message.senderId.slice(0, 6);
-  label.style.backgroundColor = message.color;
-  cursorElement.appendChild(label);
-
-  const marker = cm.setBookmark({ line: message.line, ch: message.ch }, {
-    widget: cursorElement,
-    insertLeft: true,
-  });
-  remoteCursors.set(message.senderId, marker);
-}
-
-function connectCollaboration() {
-  if (!currentProject) return;
-  if (collaborationSocket) collaborationSocket.close();
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  collaborationSocket = new WebSocket(
-    `${protocol}//${location.host}/collaboration/${encodeURIComponent(currentProject)}`
-  );
-  collaborationSocket.addEventListener('open', () => {
-    // A reconnect succeeded before the grace timer fired, so cancel the
-    // pending "reconnecting…" status change and reset the backoff.
-    clearTimeout(collaborationStatusGraceTimer);
-    setCollaborationStatus('collaborating', 'ok');
-    collaborationReconnectDelay = 1000;
+  const baseUrl = `${protocol}//${location.host}/collaboration/${encodeURIComponent(projectName)}`;
+
+  currentYDoc = new Y.Doc();
+  currentProvider = new WebsocketProvider(baseUrl, encodeURIComponent(filePath), currentYDoc);
+
+  currentProvider.awareness.setLocalStateField('user', {
+    name: collaboratorLabel,
+    color: COLLABORATOR_COLORS[currentYDoc.clientID % COLLABORATOR_COLORS.length],
   });
-  collaborationSocket.addEventListener('message', (event) => {
-    const message = JSON.parse(event.data);
-    if (message.type === 'connected') {
-      collaborationColor = message.color;
-      collaborationSocket.send(JSON.stringify({ type: 'hello', senderId: collaborationSenderId }));
-      sendCollaborationCursor();
-      return;
-    }
-    if (message.type === 'cursor') {
-      renderRemoteCursor(message);
-      return;
-    }
-    if (message.type === 'leave') {
-      const marker = remoteCursors.get(message.senderId);
-      if (marker) marker.clear();
-      remoteCursors.delete(message.senderId);
-      return;
-    }
-    if (message.type !== 'edit' || message.senderId === collaborationSenderId) return;
-    if (!currentFile || currentFile.path !== message.path) return;
-    suppressChangeEvents = true;
-    cm.setValue(message.content);
-    suppressChangeEvents = false;
-    setDirty(false);
+
+  const thisProvider = currentProvider;
+
+  currentProvider.on('status', ({ status }) => {
+    if (currentProvider !== thisProvider) return;
+
+    if (status === 'connected') setCollaborationStatus('collaborating', 'ok');
+    else if (status === 'connecting') setCollaborationStatus('connecting…', 'unknown');
+    else setCollaborationStatus('reconnecting…', 'unknown');
   });
-  collaborationSocket.addEventListener('close', () => {
-    clearRemoteCursors();
-    // Wait briefly before showing "reconnecting…" — a single dropped ping
-    // over a relayed connection is often followed by an instant successful
-    // reconnect, and flashing the status for that is just noise.
-    clearTimeout(collaborationStatusGraceTimer);
-    collaborationStatusGraceTimer = setTimeout(() => {
-      setCollaborationStatus('reconnecting…', 'unknown');
-    }, 400);
-    clearTimeout(collaborationReconnectTimer);
-    collaborationReconnectTimer = setTimeout(connectCollaboration, collaborationReconnectDelay);
-    // Back off exponentially (capped at 10s) so a flaky relay path doesn't
-    // hammer the server with reconnect attempts once per second.
-    collaborationReconnectDelay = Math.min(collaborationReconnectDelay * 2, 10_000);
-  });
-  collaborationSocket.addEventListener('error', () => {
+
+  currentProvider.on('connection-error', () => {
+    if (currentProvider !== thisProvider) return;
     setCollaborationStatus('offline', 'missing');
   });
+
+  const ytext = currentYDoc.getText('content');
+
+  // CodemirrorBinding initially sets the editor content from Y.Text.
+  // Suppress dirty tracking so opening a file does not mark it as unsaved.
+  suppressChangeEvents = true;
+  currentBinding = new CodemirrorBinding(ytext, cm, currentProvider.awareness);
+  suppressChangeEvents = false;
 }
-
-function queueCollaborationEdit() {
-  if (!collaborationSocket || collaborationSocket.readyState !== WebSocket.OPEN || !currentFile) return;
-  clearTimeout(collaborationEditTimer);
-  collaborationEditTimer = setTimeout(() => {
-    collaborationSocket.send(JSON.stringify({
-      type: 'edit',
-      path: currentFile.path,
-      content: cm.getValue(),
-      senderId: collaborationSenderId,
-    }));
-  }, 100);
-}
-
-cm.on('change', () => {
-  if (suppressChangeEvents) return;
-  if (currentFile && currentFile.editable) {
-    setDirty(true);
-    queueCollaborationEdit();
-  }
-});
-
-cm.on('cursorActivity', sendCollaborationCursor);
 
 function setDirty(value) {
   dirty = value;
@@ -285,6 +214,19 @@ function setDirty(value) {
   saveBtn.disabled = !dirty;
   saveBtn.classList.toggle('dirty', dirty);
 }
+
+// y-codemirror uses this origin for remote edits, so they don't mark the file dirty.
+// Only edits made locally should trigger the "unsaved changes" indicator.
+const REMOTE_EDIT_ORIGIN = 'y-codemirror';
+
+cm.on('change', (instance, changeObj) => {
+  if (suppressChangeEvents) return;
+  if (changeObj && changeObj.origin === REMOTE_EDIT_ORIGIN) return;
+
+  if (currentFile && currentFile.editable) {
+    setDirty(true);
+  }
+});
 
 // tectonic status
 async function refreshTectonicStatus() {
@@ -326,7 +268,8 @@ async function loadProjects(selectName) {
 }
 
 async function switchProject(name) {
-  clearRemoteCursors();
+  teardownCollaboration();
+  setCollaborationStatus('no file open', 'unknown');
   currentProject = name;
   currentFile = null;
   expandedFolders = new Set();
@@ -336,7 +279,6 @@ async function switchProject(name) {
   cm.setValue('');
   suppressChangeEvents = false;
   cm.setOption('readOnly', true);
-  connectCollaboration();
   await loadTree();
 }
 
@@ -463,6 +405,8 @@ async function openFile(node) {
   }
 
   if (!node.editable) {
+    teardownCollaboration();
+    setCollaborationStatus('not editable', 'unknown');
     currentFile = { path: node.path, editable: false };
     activeFileNameEl.textContent = `${node.path} (not editable)`;
     suppressChangeEvents = true;
@@ -485,12 +429,19 @@ async function openFile(node) {
 
   currentFile = { path: node.path, editable: true };
   activeFileNameEl.textContent = node.path;
+  // Tear down the previous file's binding before changing cm's content.
+  // Otherwise, the old binding could treat the new file's content as an edit.
+  teardownCollaboration();
+
+  // Temporary fallback content; openCollaboration() immediately replaces it
+  // with the shared Y.Text content when the new binding is created.
+
   suppressChangeEvents = true;
   cm.setValue(data.content);
   suppressChangeEvents = false;
   cm.setOption('readOnly', false);
   setDirty(false);
-  sendCollaborationCursor();
+  openCollaboration(currentProject, node.path);
   loadTree();
 }
 
@@ -571,6 +522,12 @@ async function renameEntry(node) {
       ? newPath
       : `${newPath}${currentFile.path.slice(node.path.length)}`;
     activeFileNameEl.textContent = currentFile.path;
+    if (currentFile.editable) {
+      // The room key is `${project}::${path}`, so a rename needs a fresh
+      // connection under the new path -- otherwise this tab would keep
+      // talking to the (now-orphaned) room for the old path.
+      openCollaboration(currentProject, currentFile.path);
+    }
   }
   await loadTree();
 }
@@ -589,6 +546,8 @@ async function deleteEntry(node) {
     return;
   }
   if (currentFile && (currentFile.path === node.path || currentFile.path.startsWith(`${node.path}/`))) {
+    teardownCollaboration();
+    setCollaborationStatus('no file open', 'unknown');
     currentFile = null;
     activeFileNameEl.textContent = 'No file open';
     suppressChangeEvents = true;
