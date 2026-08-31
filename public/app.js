@@ -130,46 +130,51 @@ let dirty = false;
 let suppressChangeEvents = false;
 
 // Real-time collaboration (Yjs)
-// Loaded from the pre-bundled public/collab-bundle.js as window.Collab.
+// Yjs pieces (Y, WebsocketProvider, CodemirrorBinding, Awareness) come from
+// the pre-bundled public/collab-bundle.js, exposed as window.Collab.
 const { Y, WebsocketProvider, CodemirrorBinding } = window.Collab;
 
-// Same collaborator color palette as before; colors are now chosen client-side
-// from each tab's Yjs client ID instead of being assigned by the server.
+// Same palette the old server-assigned colors used, but now picked
+// client-side (deterministically from each tab's Yjs client ID).
 const COLLABORATOR_COLORS = ['#d6336c', '#1971c2', '#2f9e44', '#e67700', '#7048e8', '#0c8599', '#c2255c', '#5f3dc4'];
-
-// Short cosmetic label shown next to remote cursors.
+// A short, friendly label shown next to remote cursors -- purely cosmetic,
+// unrelated to the Yjs/websocket protocol itself.
 const collaboratorLabel = Math.random().toString(36).slice(2, 8);
 
-// Yjs state for the currently open file; only one set exists at a time.
+// The live Yjs pieces for whatever file is open; torn down before the next
+// file/project opens so no WebsocketProvider connection leaks.
 let currentYDoc = null;
 let currentProvider = null;
 let currentBinding = null;
+// The server's per-process ID (GET /api/server-instance-id), checked before
+// letting a dropped connection auto-reconnect so a restart can be told apart
+// from a brief blip before Yjs re-syncs. null means not yet checked.
+let knownServerInstanceId = null;
 
 function setCollaborationStatus(text, kind = 'unknown') {
   collaborationStatus.textContent = text;
   collaborationStatus.className = `status-pill status-${kind}`;
 }
 
-// Clean up the current Yjs document, binding, and WebSocket connection.
+// Tears down the Yjs doc/provider/binding for whatever file was previously
+// open, if any. Safe to call even when nothing is open.
 function teardownCollaboration() {
   if (currentBinding) {
     currentBinding.destroy();
     currentBinding = null;
   }
-
   if (currentProvider) {
-    currentProvider.destroy(); // Also closes the underlying WebSocket.
+    currentProvider.destroy(); // also closes the underlying WebSocket
     currentProvider = null;
   }
-
   if (currentYDoc) {
     currentYDoc.destroy();
     currentYDoc = null;
   }
 }
 
-// Open real-time collaboration for a file using a dedicated Yjs room.
-// The room matches the server's project/file key.
+// Opens/re-opens collaboration for a file: Y.Doc + WebsocketProvider on its
+// room + CodemirrorBinding to the editor. Callers must tear down any previous binding first, or a stray setValue() leaks into the old file's Y.Text.
 function openCollaboration(projectName, filePath) {
   teardownCollaboration();
 
@@ -178,34 +183,95 @@ function openCollaboration(projectName, filePath) {
 
   currentYDoc = new Y.Doc();
   currentProvider = new WebsocketProvider(baseUrl, encodeURIComponent(filePath), currentYDoc);
-
   currentProvider.awareness.setLocalStateField('user', {
     name: collaboratorLabel,
     color: COLLABORATOR_COLORS[currentYDoc.clientID % COLLABORATOR_COLORS.length],
   });
 
   const thisProvider = currentProvider;
+  // Best-effort: record which server we're talking to now, so a later
+  // reconnect can detect a restart. Not load-bearing if it fails.
+  fetch('/api/server-instance-id')
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => { if (data) knownServerInstanceId = data.id; })
+    .catch(() => {});
 
   currentProvider.on('status', ({ status }) => {
     if (currentProvider !== thisProvider) return;
-
-    if (status === 'connected') setCollaborationStatus('collaborating', 'ok');
-    else if (status === 'connecting') setCollaborationStatus('connecting…', 'unknown');
-    else setCollaborationStatus('reconnecting…', 'unknown');
+    if (status === 'connected') {
+      setCollaborationStatus('collaborating', 'ok');
+    } else if (status === 'connecting') {
+      setCollaborationStatus('connecting…', 'unknown');
+    } else if (status === 'disconnected') {
+      setCollaborationStatus('reconnecting…', 'unknown');
+      // Halt auto-reconnect and verify server identity over plain HTTP first,
+      // since resuming blindly could duplicate content if the server restarted.
+      thisProvider.disconnect();
+      confirmServerIdentityBeforeReconnecting(thisProvider, projectName, filePath);
+    }
   });
-
   currentProvider.on('connection-error', () => {
     if (currentProvider !== thisProvider) return;
     setCollaborationStatus('offline', 'missing');
   });
 
   const ytext = currentYDoc.getText('content');
-
-  // CodemirrorBinding initially sets the editor content from Y.Text.
-  // Suppress dirty tracking so opening a file does not mark it as unsaved.
+  // The binding's constructor immediately calls cm.setValue() to sync the
+  // editor; suppress dirty-tracking for that one programmatic call.
   suppressChangeEvents = true;
   currentBinding = new CodemirrorBinding(ytext, cm, currentProvider.awareness);
   suppressChangeEvents = false;
+}
+
+// Called after a provider disconnects, instead of letting it auto-reconnect
+// unchecked. Polls a plain HTTP endpoint (not Yjs) to see if the server is
+// still the same process, then either resumes or reopens the file fresh.
+async function confirmServerIdentityBeforeReconnecting(provider, projectName, filePath, attempt = 0) {
+  if (currentProvider !== provider) return; // superseded by a newer openCollaboration() call
+
+  let currentId = null;
+  try {
+    const res = await fetch('/api/server-instance-id');
+    if (res.ok) currentId = (await res.json()).id;
+  } catch {
+    // Server not reachable yet (still restarting, or a real outage) --
+    // fall through to the retry below.
+  }
+
+  if (currentProvider !== provider) return; // could have changed while awaiting
+
+  if (currentId === null) {
+    const backoffMs = Math.min(2 ** attempt * 200, 5000);
+    setTimeout(
+      () => confirmServerIdentityBeforeReconnecting(provider, projectName, filePath, attempt + 1),
+      backoffMs
+    );
+    return;
+  }
+
+  if (knownServerInstanceId === null || currentId === knownServerInstanceId) {
+    knownServerInstanceId = currentId;
+    provider.connect();
+  } else {
+    knownServerInstanceId = currentId;
+    // Old edits may not have reached disk before the crash; capture content
+    // and only prompt if it actually differs from the resynced server copy.
+    const preRestartContent = cm.getValue();
+    openCollaboration(projectName, filePath);
+    const newProvider = currentProvider;
+    newProvider.once('sync', () => {
+      if (currentProvider !== newProvider) return; // switched files again meanwhile
+      if (cm.getValue() === preRestartContent) return; // nothing lost, no need to bother anyone
+      const keepLocal = confirm(
+        `The real-time collaboration server restarted, and your local copy of ` +
+        `"${filePath}" has content the server doesn't have -- most likely edits ` +
+        `made in the last moment before the restart that hadn't been saved yet.\n\n` +
+        `Click OK to keep YOUR version (it will be saved as new edits).\n` +
+        `Click Cancel to use the server's current version instead.`
+      );
+      if (keepLocal) cm.setValue(preRestartContent);
+    });
+  }
 }
 
 function setDirty(value) {
@@ -215,14 +281,13 @@ function setDirty(value) {
   saveBtn.classList.toggle('dirty', dirty);
 }
 
-// y-codemirror uses this origin for remote edits, so they don't mark the file dirty.
-// Only edits made locally should trigger the "unsaved changes" indicator.
+// y-codemirror tags remote-peer edits with this origin so they can be told
+// apart from local typing; only local edits should mark the file dirty.
 const REMOTE_EDIT_ORIGIN = 'y-codemirror';
 
 cm.on('change', (instance, changeObj) => {
   if (suppressChangeEvents) return;
   if (changeObj && changeObj.origin === REMOTE_EDIT_ORIGIN) return;
-
   if (currentFile && currentFile.editable) {
     setDirty(true);
   }
@@ -429,13 +494,11 @@ async function openFile(node) {
 
   currentFile = { path: node.path, editable: true };
   activeFileNameEl.textContent = node.path;
-  // Tear down the previous file's binding before changing cm's content.
-  // Otherwise, the old binding could treat the new file's content as an edit.
+  // Tear down the previous file's binding before touching cm's content --
+  // otherwise a stray setValue() gets pushed into its shared Y.Text.
   teardownCollaboration();
-
-  // Temporary fallback content; openCollaboration() immediately replaces it
-  // with the shared Y.Text content when the new binding is created.
-
+  // Immediately superseded by openCollaboration's binding below; kept as a
+  // same-tick fallback in case binding setup fails.
   suppressChangeEvents = true;
   cm.setValue(data.content);
   suppressChangeEvents = false;
@@ -523,9 +586,8 @@ async function renameEntry(node) {
       : `${newPath}${currentFile.path.slice(node.path.length)}`;
     activeFileNameEl.textContent = currentFile.path;
     if (currentFile.editable) {
-      // The room key is `${project}::${path}`, so a rename needs a fresh
-      // connection under the new path -- otherwise this tab would keep
-      // talking to the (now-orphaned) room for the old path.
+      // Room key is `${project}::${path}`, so rename needs a fresh connection
+      // under the new path or this tab keeps talking to the orphaned room.
       openCollaboration(currentProject, currentFile.path);
     }
   }

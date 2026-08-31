@@ -9,37 +9,31 @@ const fsSync = require('fs'); // used only to seed a new room's content synchron
 const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-// Server-side sync + awareness building blocks for Yjs's WebSocket protocol.
-// y-websocket is pinned to 1.5.x specifically because this subpath (server
-// utilities) was split out of the package in 2.x/3.x -- newer versions only
-// ship the client-side WebsocketProvider.
+// Server-side sync + awareness helpers for Yjs's WebSocket protocol. Pinned to
+// y-websocket 1.5.x since 2.x/3.x dropped these server utilities.
 const { setupWSConnection, getYDoc, docs: yDocs } = require('y-websocket/bin/utils');
 
 const PORT = process.env.PORT || 3000;
+// Fresh ID per process start, used by clients to detect a server restart and
+// force a hard-resync instead of letting Yjs merge against a re-seeded doc.
+const SERVER_INSTANCE_ID = crypto.randomBytes(8).toString('hex');
 const COMPILE_TIMEOUT_MS = 120_000;
-const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write; also used as the collaboration WebSocket's maxPayload 
+const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write
 const MAX_PROJECT_BYTES = 25 * 1024 * 1024;    // cap for total project size when compiling
 
-// Where all projects live on disk -- a folder at the same level as
-// server.js/public/. Each subdirectory of this is one project; each
-// project's own subdirectory structure is shown as the file tree in the
-// UI and is exactly what gets compiled (so \input, \include,
-// \includegraphics, \bibliography etc. all resolve normally).
+// Where all projects live on disk. Each subdirectory is one project, shown
+// as-is in the UI file tree and compiled directly, so \input/\include work.
 const PROJECTS_ROOT = path.join(__dirname, 'projects');
 
-// Extensions we treat as editable text in the browser. Anything else
-// (images, existing PDFs, etc.) still shows up in the tree so the folder
-// layout is visible, but isn't opened as text -- reading/writing a binary
-// file as utf8 would corrupt it.
+// Extensions treated as editable text. Other files still show in the tree
+// but aren't opened as text, since reading/writing them as utf8 would corrupt them.
 const TEXT_EXTENSIONS = new Set([
   '.tex', '.bib', '.cls', '.sty', '.txt', '.md', '.json', '.yml', '.yaml', '.log',
 ]);
 
-// If true, adds --only-cached so tectonic refuses to reach out to the network
-// for *any* package it doesn't already have cached, instead of silently
-// fetching. This does NOT sandbox the network at the OS level -- it only
-// stops tectonic itself from trying. Off by default because most fresh
-// installs need one online compile to warm the bundle cache.
+// If true, blocks tectonic from fetching uncached packages (app-level only,
+// not OS network sandboxing). Off by default since a fresh install needs one
+// online compile to warm the cache.
 const ONLY_CACHED = process.env.TECTONIC_ONLY_CACHED === '1';
 const compileWorkspaces = new Map();
 const compileLocks = new Map();
@@ -51,16 +45,16 @@ app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app);
 const collaborationServer = new WebSocketServer({ noServer: true, maxPayload: MAX_FILE_BYTES });
 
-// Real-time collaborative editing with Yjs.
-// Each file has its own Y.Doc, keyed by `${projectName}::${filePath}`,
-// with a Y.Text named "content". This file wires up the server side of
-// Yjs's sync + awareness protocol (via y-websocket's utilities) 
+// --- Real-time collaborative editing (Yjs) ---------------------------------
+// Each file gets its own Y.Doc (keyed by project+path) with a Y.Text "content".
+// Sync and presence are handled by y-websocket's server helpers, which also
+// auto-reconnect/resync clients, replacing the old manual broadcast/heartbeat logic.
 function roomKeyFor(projectName, filePath) {
   return `${projectName}::${filePath}`;
 }
 
-// Debounce delay before persisting the room's content to disk.
-// Yjs updates are sent to peers immediately.
+// How long to wait after the last edit before persisting a room to disk;
+// Yjs updates themselves are still sent to peers immediately, undebounced.
 const PERSIST_DEBOUNCE_MS = 500;
 const persistTimers = new Map(); // roomKey -> Timeout
 
@@ -75,7 +69,7 @@ function schedulePersist(roomKey, projectName, filePath) {
     if (!abs) return;
     try {
       // The project or the file itself may have been deleted/renamed out
-      // from under an active room hence, skip the write rather than recreate it.
+      // from under an active room; skip the write rather than recreate it.
       if (!(await projectExists(root))) return;
       await fs.writeFile(abs, doc.getText('content').toString(), 'utf8');
     } catch {
@@ -111,14 +105,14 @@ server.on('upgrade', (request, socket, head) => {
 collaborationServer.on('connection', (client, request, { projectName, filePath }) => {
   const roomKey = roomKeyFor(projectName, filePath);
   const isNewRoom = !yDocs.has(roomKey);
-// getYDoc registers new docs synchronously, so concurrent connections
-// correctly skip reseeding and duplicate persistence listeners.
+  // getYDoc creates/registers the doc synchronously, so a concurrent second
+  // connection to the same new room sees isNewRoom === false and skips reseeding.
   const doc = getYDoc(roomKey);
 
   if (isNewRoom) {
-    // Seed the Y.Text from disk only when the room is first created.
-    // This must happen synchronously before setupWSConnection so the
-    // initial client sync message is not missed.
+    // Seed the Y.Text from disk once, at room creation (not every connection).
+    // Must be synchronous, before setupWSConnection attaches its listener below,
+    // or an early client sync message could arrive and be dropped.
     const root = projectRootFor(projectName);
     const abs = resolveSafePath(root, filePath);
     let initialContent = '';
@@ -158,6 +152,12 @@ if (!startupCheck.available) {
 
 app.get('/api/tectonic-status', (req, res) => {
   res.json(checkTectonicAvailable());
+});
+
+// Lets a client check over plain HTTP whether it's still talking to the same
+// server process, before allowing an auto WebSocket reconnect (see app.js).
+app.get('/api/server-instance-id', (req, res) => {
+  res.json({ id: SERVER_INSTANCE_ID });
 });
 
 // Projects root setup: create the folder if missing, seed a demo project
@@ -485,9 +485,8 @@ app.post('/api/projects/:project/compile', async (req, res) => {
     });
   }
 
-  // Compile from a cached throwaway copy of the whole project, not the
-  // project directory itself. Keeping this sandbox between builds lets
-  // Tectonic reuse .aux, .toc, bibliography, and other intermediates.
+  // Compile in a reused throwaway copy of the project (not the project dir
+  // itself), so Tectonic can reuse .aux/.toc/bib intermediates across builds.
   const entryBase = path.basename(entryRel, '.tex');
   let compileOutput;
   try {

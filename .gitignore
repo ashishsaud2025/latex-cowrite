@@ -1,4 +1,6 @@
 node_modules/
+public/collab-bundle.js
+public/collab-bundle.js.map
 projects/
 tools/
 todo.md
