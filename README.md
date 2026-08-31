@@ -152,7 +152,25 @@ From the project root:
 npm install
 ```
 
-### 5. Run the application
+### 5. Build the real-time collaboration bundle
+
+Real-time collaborative editing is powered by [Yjs](https://yjs.dev), which
+is published as ES modules meant for a bundler. Since the rest of this
+app's frontend intentionally has no build step (CodeMirror is loaded from a
+CDN `<script>` tag, and `app.js` is a plain script), only this piece gets
+pre-bundled, into `public/collab-bundle.js`:
+
+```bash
+npm run build
+```
+
+Run this once after `npm install`, and again any time you change the
+collaboration bundle's dependencies (`yjs`, `y-protocols`, `y-websocket`, or
+`y-codemirror` in `package.json`, or `collab-src/index.js` itself).
+`public/collab-bundle.js` (and its sourcemap) are build output, not meant to
+be hand-edited.
+
+### 6. Run the application
 
 ```bash
 npm start
@@ -164,7 +182,10 @@ Open:
 http://localhost:3000
 ```
 
-Enter some LaTeX in the left pane and click **Compile**.
+Enter some LaTeX in the left pane and click **Compile**. Open the same
+project in a second browser tab (or from a second computer) to see live,
+character-level collaborative editing, the "collaborating" pill above the
+editor reflects that file's real-time connection status.
 
 ## Working with projects
 
@@ -362,7 +383,6 @@ On failure (`4xx`/`5xx`):
 * Async compilation with a job ID
 * Polling or WebSocket support for compile status
 * Live compilation log streaming
-* CRDT-based synchronization for conflict-free simultaneous edits
 * Compile concurrency limits for multi-user deployments (the current server
   serializes builds only within one project)
 * Stronger filesystem isolation
