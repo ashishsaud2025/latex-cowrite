@@ -277,8 +277,10 @@ Large or complex documents can take significantly longer to compile. This is esp
 * Documents with many images
 * Complex packages
 
-The current implementation uses a synchronous request with a 120-second hard
-timeout. The PDF response is not returned until compilation completes.
+The current implementation uses an asynchronous compile job with a 120-second
+hard execution timeout. The client calls `/api/projects/:project/compile/start`
+and receives a `jobId` immediately; it then polls `/status` and listens for log
+updates until the build finishes, after which the PDF is fetched from `/pdf`.
 
 For faster drafting, keep expensive TikZ/PGFPlots figures and large image
 directories out of the document while working, and use a temporary lightweight
@@ -286,7 +288,8 @@ entry file that inputs only the chapter being edited. Restore `main.tex` for
 the final full-report build. The app does not yet provide a draft/partial-build
 mode automatically.
 
-An asynchronous job queue with polling or WebSocket support is planned for a future phase. This will allow longer compilations and provide live compilation logs.
+Async compilation with a job ID, polling, and live log streaming are now part
+of the implemented workflow.
 
 ## API
 
@@ -352,11 +355,43 @@ Request body: `{ "path": "sections/results.tex", "type": "file" }` (`type` is `"
 
 `201` on success, `409` if the path already exists.
 
-### `POST /api/projects/:project/compile`
+### `POST /api/projects/:project/compile/start`
 
-Compiles the project's entry file (`main.tex` if present at the top level, otherwise the first top-level `.tex` file).
+Starts an asynchronous compile job for the project's entry file (`main.tex` if present at the top level, otherwise the first top-level `.tex` file).
 
-On success:
+On success (`202 Accepted`):
+
+```json
+{
+  "jobId": "0123456789abcdef",
+  "entry": "main.tex",
+  "status": "running"
+}
+```
+
+### `GET /api/projects/:project/compile/:jobId/status`
+
+Returns the current job state and result metadata.
+
+```json
+{
+  "jobId": "0123456789abcdef",
+  "status": "success",
+  "entry": "main.tex",
+  "error": null,
+  "log": "<tectonic compilation log>",
+  "cached": false,
+  "hasPdf": true
+}
+```
+
+### `GET /api/projects/:project/compile/:jobId/logs`
+
+Streams live compile logs over Server-Sent Events (`text/event-stream`).
+
+### `GET /api/projects/:project/compile/:jobId/pdf`
+
+Returns the compiled PDF once the job has finished successfully.
 
 ```text
 200 OK
@@ -364,25 +399,12 @@ Content-Type: application/pdf
 X-Compiled-Entry: main.tex
 ```
 
-The response body is the raw PDF bytes.
-
-On failure (`4xx`/`5xx`):
-
-```json
-{
-  "error": "tectonic exited with code 1.",
-  "log": "<tectonic compilation log>",
-  "entry": "main.tex"
-}
-```
+On failure, the status endpoint returns an `error` payload along with the log and entry name.
 
 ## Roadmap
 
 ### Future improvements
 
-* Async compilation with a job ID
-* Polling or WebSocket support for compile status
-* Live compilation log streaming
 * Compile concurrency limits for multi-user deployments (the current server
   serializes builds only within one project)
 * Stronger filesystem isolation
