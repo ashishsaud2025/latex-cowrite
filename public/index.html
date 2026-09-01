@@ -54,16 +54,25 @@
     <div id="preview-toolbar">
       <span id="compile-state"></span>
     </div>
-    <div id="pdf-container">
-      <p id="pdf-placeholder">Click "Compile" to render a preview.</p>
+    <div id="preview-tabs" role="tablist" aria-label="Preview tabs">
+      <button id="pdf-tab" class="preview-tab active" type="button" role="tab" aria-selected="true" aria-controls="pdf-view" data-view="pdf">PDF</button>
+      <button id="log-tab" class="preview-tab" type="button" role="tab" aria-selected="false" aria-controls="log-view" data-view="log">Logs</button>
     </div>
-    <div id="log-panel" class="hidden">
-      <div id="log-resizer" class="resize-handle resize-handle-horizontal" role="separator" aria-label="Resize compile log" aria-orientation="horizontal" tabindex="0"></div>
-      <div id="log-panel-header">
-        <strong>Compile log</strong>
-        <button id="log-close">×</button>
+    <div id="preview-content">
+      <div id="pdf-view" class="preview-view active" role="tabpanel" aria-labelledby="pdf-tab">
+        <div id="pdf-container">
+          <p id="pdf-placeholder">Click "Compile" to render a preview.</p>
+        </div>
       </div>
-      <pre id="log-content"></pre>
+      <div id="log-view" class="preview-view" role="tabpanel" aria-labelledby="log-tab">
+        <div id="log-panel">
+          <div id="log-panel-header">
+            <strong>Compile log</strong>
+            <button id="log-close" type="button" aria-label="Close log">×</button>
+          </div>
+          <pre id="log-content"></pre>
+        </div>
+      </div>
     </div>
   </section>
 </main>

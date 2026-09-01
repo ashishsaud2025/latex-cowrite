@@ -16,6 +16,8 @@ const pdfContainer = document.getElementById('pdf-container');
 const logPanel = document.getElementById('log-panel');
 const logContent = document.getElementById('log-content');
 const logClose = document.getElementById('log-close');
+const pdfTab = document.getElementById('pdf-tab');
+const logTab = document.getElementById('log-tab');
 const statusPill = document.getElementById('tectonic-status');
 const editorPane = document.getElementById('editor-pane');
 const previewPane = document.getElementById('preview-pane');
@@ -25,6 +27,10 @@ const paneResizer = document.getElementById('pane-resizer');
 const logResizer = document.getElementById('log-resizer');
 const collaborationStatus = document.getElementById('collaboration-status');
 let pdfObjectUrl = null;
+let currentCompileJobId = null;
+let currentCompileStream = null;
+let currentCompilePollTimer = null;
+let activePreviewTab = 'pdf';
 
 function loadWorkspaceSize(name, fallback) {
   const value = Number(localStorage.getItem(`longtex-${name}`));
@@ -105,12 +111,14 @@ setupResizeHandle(paneResizer, 'x', () => ({
   editorPane.style.flexBasis = `${size}px`;
 }, 'editor-width', mainEl.clientWidth / 2);
 
-setupResizeHandle(logResizer, 'y', () => ({
-  min: 70,
-  max: Math.max(140, previewPane.clientHeight * 0.7),
-}), (size) => {
-  logPanel.style.height = `${size}px`;
-}, 'log-height', 220);
+if (logResizer) {
+  setupResizeHandle(logResizer, 'y', () => ({
+    min: 70,
+    max: Math.max(140, previewPane.clientHeight * 0.7),
+  }), (size) => {
+    logPanel.style.height = `${size}px`;
+  }, 'log-height', 220);
+}
 
 // Editor
 const cm = CodeMirror.fromTextArea(document.getElementById('source'), {
@@ -635,15 +643,134 @@ function setToolbar(text, kind) {
   toolbarEl.className = kind || '';
 }
 
+function setPreviewTab(view) {
+  activePreviewTab = view;
+  const isPdf = view === 'pdf';
+  pdfTab.classList.toggle('active', isPdf);
+  logTab.classList.toggle('active', !isPdf);
+  pdfTab.setAttribute('aria-selected', String(isPdf));
+  logTab.setAttribute('aria-selected', String(!isPdf));
+  document.getElementById('pdf-view').classList.toggle('active', isPdf);
+  document.getElementById('log-view').classList.toggle('active', !isPdf);
+}
+
 function showLog(text) {
   logContent.textContent = text || '(empty)';
-  logPanel.classList.remove('hidden');
+  setPreviewTab('log');
+}
+
+function appendLog(text) {
+  const existing = logContent.textContent || '';
+  const next = existing + (existing && !existing.endsWith('\n') ? '\n' : '') + text;
+  logContent.textContent = next;
+  logContent.scrollTop = logContent.scrollHeight;
+  if (activePreviewTab === 'log') {
+    setPreviewTab('log');
+  }
 }
 
 function hideLog() {
-  logPanel.classList.add('hidden');
+  setPreviewTab('pdf');
 }
 
+function stopCompileStream() {
+  if (currentCompileStream) {
+    currentCompileStream.close();
+    currentCompileStream = null;
+  }
+  if (currentCompilePollTimer) {
+    clearTimeout(currentCompilePollTimer);
+    currentCompilePollTimer = null;
+  }
+  currentCompileJobId = null;
+}
+
+function openCompileLogStream(projectName, jobId) {
+  stopCompileStream();
+  currentCompileJobId = jobId;
+  const streamUrl = `/api/projects/${encodeURIComponent(projectName)}/compile/${encodeURIComponent(jobId)}/logs`;
+  const stream = new EventSource(streamUrl);
+  currentCompileStream = stream;
+
+  stream.addEventListener('log', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      appendLog(payload.text || '');
+    } catch {
+      appendLog(String(event.data || ''));
+    }
+  });
+
+  stream.addEventListener('status', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload.status === 'running') {
+        setToolbar('Compiling…', '');
+      }
+    } catch {
+      // ignore malformed status updates
+    }
+  });
+
+  stream.onerror = () => {
+    stream.close();
+    if (currentCompileStream === stream) {
+      currentCompileStream = null;
+    }
+  };
+}
+
+async function pollCompileStatus(projectName, jobId) {
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(projectName)}/compile/${encodeURIComponent(jobId)}/status`);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Could not read compile status.');
+    }
+
+    if (data.status === 'success') {
+      if (data.cached) {
+        const pdfRes = await fetch(`/api/projects/${encodeURIComponent(projectName)}/compile/${encodeURIComponent(jobId)}/pdf`);
+        if (pdfRes.ok) {
+          const buf = await pdfRes.arrayBuffer();
+          document.getElementById('pdf-placeholder')?.remove();
+          renderPdf(buf);
+          setToolbar(`Loaded cached ${data.entry}.`, 'ok');
+          setPreviewTab('pdf');
+        }
+      } else {
+        const pdfRes = await fetch(`/api/projects/${encodeURIComponent(projectName)}/compile/${encodeURIComponent(jobId)}/pdf`);
+        if (pdfRes.ok) {
+          const buf = await pdfRes.arrayBuffer();
+          document.getElementById('pdf-placeholder')?.remove();
+          renderPdf(buf);
+          setToolbar(`Compiled ${data.entry} successfully.`, 'ok');
+          setPreviewTab('pdf');
+        }
+      }
+      stopCompileStream();
+      return;
+    }
+
+    if (data.status === 'error' || data.status === 'timeout') {
+      setToolbar(data.error || 'Compile failed.', 'error');
+      showLog(data.log || '');
+      stopCompileStream();
+      return;
+    }
+
+    if (data.status === 'running') {
+      currentCompilePollTimer = setTimeout(() => pollCompileStatus(projectName, jobId), 400);
+    }
+  } catch (err) {
+    setToolbar(`Request failed: ${err.message}`, 'error');
+    showLog(String(err.stack || err));
+    stopCompileStream();
+  }
+}
+
+pdfTab.addEventListener('click', () => setPreviewTab('pdf'));
+logTab.addEventListener('click', () => setPreviewTab('log'));
 logClose.addEventListener('click', hideLog);
 
 function renderPdf(arrayBuffer) {
@@ -671,28 +798,30 @@ async function compile() {
   compileBtn.disabled = true;
   compileBtn.textContent = 'Compiling…';
   setToolbar('Compiling…', '');
-  hideLog();
+  logContent.textContent = '';
+  setPreviewTab('pdf');
 
   try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/compile`, {
+    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/compile/start`, {
       method: 'POST',
     });
-    const contentType = res.headers.get('Content-Type') || '';
+    const data = await res.json().catch(() => ({ error: `HTTP ${res.status}`, log: '' }));
 
-    if (res.ok && contentType.includes('application/pdf')) {
-      const entry = res.headers.get('X-Compiled-Entry') || '';
-      const cached = res.headers.get('X-Compile-Cached') === 'true';
-      const buf = await res.arrayBuffer();
-      document.getElementById('pdf-placeholder')?.remove();
-      renderPdf(buf);
-      setToolbar(cached ? `Loaded cached ${entry}.` : `Compiled ${entry} successfully.`, 'ok');
-      hideLog();
-    } else {
-      const data = await res.json().catch(() => ({ error: `HTTP ${res.status}`, log: '' }));
+    if (!res.ok) {
       setToolbar(data.error || 'Compile failed.', 'error');
       showLog(data.log || '');
       refreshTectonicStatus();
+      return;
     }
+
+    const { jobId, entry } = data;
+    if (!jobId) {
+      throw new Error('Compile did not return a job ID.');
+    }
+
+    openCompileLogStream(currentProject, jobId);
+    pollCompileStatus(currentProject, jobId);
+    setToolbar(`Compiling ${entry || 'project'}…`, '');
   } catch (err) {
     setToolbar(`Request failed: ${err.message}`, 'error');
     showLog(String(err.stack || err));
