@@ -38,6 +38,7 @@ const ONLY_CACHED = process.env.TECTONIC_ONLY_CACHED === '1';
 const compileWorkspaces = new Map();
 const compileLocks = new Map();
 const compileCache = new Map();
+const compileJobs = new Map();
 
 const app = express();
 app.use(express.json({ limit: '3mb' }));
@@ -45,7 +46,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app);
 const collaborationServer = new WebSocketServer({ noServer: true, maxPayload: MAX_FILE_BYTES });
 
-// --- Real-time collaborative editing (Yjs) ---------------------------------
+// Real-time collaborative editing (Yjs)
 // Each file gets its own Y.Doc (keyed by project+path) with a Y.Text "content".
 // Sync and presence are handled by y-websocket's server helpers, which also
 // auto-reconnect/resync clients, replacing the old manual broadcast/heartbeat logic.
@@ -152,6 +153,113 @@ if (!startupCheck.available) {
 
 app.get('/api/tectonic-status', (req, res) => {
   res.json(checkTectonicAvailable());
+});
+
+app.post('/api/projects/:project/compile/start', async (req, res) => {
+  const projectName = req.params.project;
+  const root = projectRootFor(projectName);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.', log: '', entry: null, jobId: null });
+  }
+
+  const status = checkTectonicAvailable();
+  if (!status.available) {
+    return res.status(500).json({
+      error: 'tectonic is not installed or not on PATH on the server. See server logs.',
+      log: '',
+      entry: null,
+      jobId: null,
+    });
+  }
+
+  let entryRel;
+  try {
+    entryRel = await findEntryFile(root);
+  } catch (err) {
+    return res.status(500).json({ error: `Could not inspect project: ${err.message}`, log: '', entry: null, jobId: null });
+  }
+  if (!entryRel) {
+    return res.status(400).json({
+      error: 'No .tex entry file found. Add a main.tex (or any top-level .tex file) to compile.',
+      log: '',
+      entry: null,
+      jobId: null,
+    });
+  }
+
+  const projectSize = await dirSizeBytes(root, MAX_PROJECT_BYTES + 1);
+  if (projectSize > MAX_PROJECT_BYTES) {
+    return res.status(413).json({
+      error: `Project exceeds ${MAX_PROJECT_BYTES} byte limit.`,
+      log: '',
+      entry: entryRel,
+      jobId: null,
+    });
+  }
+
+  const job = await beginCompileJob(projectName, entryRel);
+  res.status(202).json({
+    jobId: job.id,
+    entry: entryRel,
+    status: job.status,
+  });
+});
+
+app.get('/api/projects/:project/compile/:jobId/status', (req, res) => {
+  const job = compileJobs.get(req.params.jobId);
+  if (!job || job.projectName !== req.params.project) {
+    return res.status(404).json({ error: 'Compile job not found.' });
+  }
+
+  res.json({
+    jobId: job.id,
+    status: job.status,
+    entry: job.entry,
+    error: job.error || null,
+    log: job.log || '',
+    cached: !!job.cached,
+    hasPdf: !!job.pdf,
+  });
+});
+
+app.get('/api/projects/:project/compile/:jobId/logs', (req, res) => {
+  const job = compileJobs.get(req.params.jobId);
+  if (!job || job.projectName !== req.params.project) {
+    return res.status(404).end('Compile job not found.');
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  job.clients.add(res);
+  if (job.status === 'running') {
+    res.write(`event: status\ndata: ${JSON.stringify({ status: 'running', entry: job.entry })}\n\n`);
+  }
+  if (job.log) {
+    res.write(`event: log\ndata: ${JSON.stringify({ text: job.log })}\n\n`);
+  }
+
+  req.on('close', () => {
+    job.clients.delete(res);
+  });
+});
+
+app.get('/api/projects/:project/compile/:jobId/pdf', async (req, res) => {
+  const job = compileJobs.get(req.params.jobId);
+  if (!job || job.projectName !== req.params.project) {
+    return res.status(404).json({ error: 'Compile job not found.' });
+  }
+
+  if (!job.pdf) {
+    return res.status(409).json({ error: 'Compile result is not ready yet.' });
+  }
+
+  res.set('Content-Type', 'application/pdf');
+  if (job.entry) res.set('X-Compiled-Entry', job.entry);
+  if (job.cached) res.set('X-Compile-Cached', 'true');
+  return res.status(200).send(job.pdf);
 });
 
 // Lets a client check over plain HTTP whether it's still talking to the same
@@ -443,136 +551,138 @@ app.delete('/api/projects/:project/entries', async (req, res) => {
   }
 });
 
-// POST /api/projects/:project/compile
-// Compiles the project's entry file (main.tex if present, else the first
-// top-level .tex file). Success: 200 application/pdf. Failure: JSON
-// { error, log, entry }.
-app.post('/api/projects/:project/compile', async (req, res) => {
-  const root = projectRootFor(req.params.project);
-  if (!root || !(await projectExists(root))) {
-    return res.status(404).json({ error: 'Project not found.', log: '', entry: null });
+function emitJobEvent(job, eventName, payload) {
+  const serialized = JSON.stringify(payload);
+  for (const response of [...job.clients]) {
+    try {
+      response.write(`event: ${eventName}\ndata: ${serialized}\n\n`);
+    } catch {
+      job.clients.delete(response);
+    }
+  }
+}
+
+function finalizeCompileJob(job, status, payload = {}) {
+  job.status = status;
+  Object.assign(job, payload);
+  emitJobEvent(job, 'status', {
+    status,
+    entry: job.entry,
+    error: job.error || null,
+    log: job.log || '',
+    cached: !!job.cached,
+    hasPdf: !!job.pdf,
+  });
+  for (const response of [...job.clients]) {
+    try {
+      response.end();
+    } catch {}
+    job.clients.delete(response);
+  }
+  if (job.status !== 'running') {
+    setTimeout(() => compileJobs.delete(job.id), 10 * 60 * 1000);
+  }
+}
+
+async function beginCompileJob(projectName, entryRel) {
+  const fingerprint = await getProjectFingerprint(projectRootFor(projectName));
+  const cached = compileCache.get(projectName);
+  const job = {
+    id: crypto.randomBytes(8).toString('hex'),
+    projectName,
+    entry: entryRel,
+    fingerprint,
+    status: 'running',
+    log: '',
+    clients: new Set(),
+    cached: false,
+  };
+  compileJobs.set(job.id, job);
+
+  if (cached && cached.entry === entryRel && cached.fingerprint === fingerprint) {
+    job.cached = true;
+    job.pdf = cached.pdf;
+    job.status = 'success';
+    job.log = 'Using cached PDF.';
+    finalizeCompileJob(job, 'success', { cached: true, pdf: cached.pdf, log: job.log });
+    return job;
   }
 
-  const status = checkTectonicAvailable();
-  if (!status.available) {
-    return res.status(500).json({
-      error: 'tectonic is not installed or not on PATH on the server. See server logs.',
-      log: '',
-      entry: null,
-    });
-  }
+  queueMicrotask(async () => {
+    try {
+      // Serialize compiles per project to prevent concurrent jobs from racing on the
+      // shared workspace. Cache-hit checks stay outside the lock since they don't touch it.
+      await withCompileLock(projectName, async () => {
+        const root = projectRootFor(projectName);
+        const jobId = job.id;
+        const tmpDir = await getCompileWorkspace(projectName, root, jobId);
+        const args = [
+          '--untrusted',
+          '-o', tmpDir,
+          '--keep-logs',
+          '--keep-intermediates',
+          '--reruns', '1',
+        ];
+        if (ONLY_CACHED) args.push('--only-cached');
+        args.push(path.join(tmpDir, entryRel));
 
-  let entryRel;
-  try {
-    entryRel = await findEntryFile(root);
-  } catch (err) {
-    return res.status(500).json({ error: `Could not inspect project: ${err.message}`, log: '', entry: null });
-  }
-  if (!entryRel) {
-    return res.status(400).json({
-      error: 'No .tex entry file found. Add a main.tex (or any top-level .tex file) to compile.',
-      log: '',
-      entry: null,
-    });
-  }
+        const result = await runTectonicStream(args, tmpDir, (chunk) => {
+          const text = String(chunk);
+          job.log += text;
+          emitJobEvent(job, 'log', { text });
+        });
 
-  const projectSize = await dirSizeBytes(root, MAX_PROJECT_BYTES + 1);
-  if (projectSize > MAX_PROJECT_BYTES) {
-    return res.status(413).json({
-      error: `Project exceeds ${MAX_PROJECT_BYTES} byte limit.`,
-      log: '',
-      entry: entryRel,
-    });
-  }
+        const logPath = path.join(tmpDir, `${path.basename(entryRel, '.tex')}.log`);
+        const log = await readIfExists(logPath);
+        const combined = combineLog(result.stdout, result.stderr, log);
+        const pdfPath = path.join(tmpDir, `${path.basename(entryRel, '.tex')}.pdf`);
 
-  // Compile in a reused throwaway copy of the project (not the project dir
-  // itself), so Tectonic can reuse .aux/.toc/bib intermediates across builds.
-  const entryBase = path.basename(entryRel, '.tex');
-  let compileOutput;
-  try {
-    compileOutput = await withCompileLock(req.params.project, async () => {
-      const fingerprint = await getProjectFingerprint(root);
-      const cached = compileCache.get(req.params.project);
-      if (cached && cached.entry === entryRel && cached.fingerprint === fingerprint) {
-        return { cached: true, pdf: cached.pdf };
-      }
+        try {
+          await publishCompileArtifacts(tmpDir, root);
+        } catch (err) {
+          job.error = `Could not publish compile artifacts: ${err.message}`;
+          finalizeCompileJob(job, 'error', { log: combined, error: job.error });
+          return;
+        }
 
-      const jobId = crypto.randomBytes(8).toString('hex');
-      const tmpDir = await getCompileWorkspace(req.params.project, root, jobId);
-      const args = [
-        '--untrusted',
-        '-o', tmpDir,
-        '--keep-logs',
-        '--keep-intermediates',
-        '--reruns', '1',
-      ];
-      if (ONLY_CACHED) args.push('--only-cached');
-      args.push(path.join(tmpDir, entryRel));
-      return {
-        cached: false,
-        fingerprint,
-        tmpDir,
-        pdfPath: path.join(tmpDir, `${entryBase}.pdf`),
-        logPath: path.join(tmpDir, `${entryBase}.log`),
-        result: await runTectonic(args, tmpDir),
-      };
-    });
-  } catch (err) {
-    return res.status(500).json({ error: `Server error: ${err.message}`, log: '', entry: entryRel });
-  }
+        if (result.timedOut) {
+          job.error = `Compilation timed out after ${COMPILE_TIMEOUT_MS / 1000}s.`;
+          finalizeCompileJob(job, 'timeout', { log: combined, error: job.error });
+          return;
+        }
+        if (result.code !== 0) {
+          job.error = `tectonic exited with code ${result.code}.`;
+          finalizeCompileJob(job, 'error', { log: combined, error: job.error });
+          return;
+        }
 
-  if (compileOutput.cached) {
-    res.set('Content-Type', 'application/pdf');
-    res.set('X-Compiled-Entry', entryRel);
-    res.set('X-Compile-Cached', 'true');
-    return res.status(200).send(compileOutput.pdf);
-  }
+        const pdfExists = await fs.access(pdfPath).then(() => true).catch(() => false);
+        if (!pdfExists) {
+          job.error = 'tectonic reported success but produced no PDF.';
+          finalizeCompileJob(job, 'error', { log: combined, error: job.error });
+          return;
+        }
 
-  const { tmpDir, pdfPath, logPath, result } = compileOutput;
-  try {
-    await publishCompileArtifacts(tmpDir, root);
-  } catch (err) {
-    return res.status(500).json({ error: `Could not publish compile artifacts: ${err.message}`, log: '', entry: entryRel });
-  }
-  if (result.timedOut) {
-    const log = await readIfExists(logPath);
-    return res.status(504).json({
-      error: `Compilation timed out after ${COMPILE_TIMEOUT_MS / 1000}s.`,
-      log: combineLog(result.stdout, result.stderr, log),
-      entry: entryRel,
-    });
-  }
-  if (result.code !== 0) {
-    const log = await readIfExists(logPath);
-    return res.status(422).json({
-      error: `tectonic exited with code ${result.code}.`,
-      log: combineLog(result.stdout, result.stderr, log),
-      entry: entryRel,
-    });
-  }
+        const pdf = await fs.readFile(pdfPath);
+        if (await getProjectFingerprint(root) === job.fingerprint) {
+          compileCache.set(projectName, {
+            entry: entryRel,
+            fingerprint: job.fingerprint,
+            pdf,
+          });
+        }
+        job.pdf = pdf;
+        job.log = combined;
+        finalizeCompileJob(job, 'success', { log: combined, cached: false, pdf });
+      });
+    } catch (err) {
+      job.error = `Server error: ${err.message}`;
+      finalizeCompileJob(job, 'error', { log: job.log || String(err.stack || err), error: job.error });
+    }
+  });
 
-  const pdfExists = await fs.access(pdfPath).then(() => true).catch(() => false);
-  if (!pdfExists) {
-    const log = await readIfExists(logPath);
-    return res.status(422).json({
-      error: 'tectonic reported success but produced no PDF.',
-      log: combineLog(result.stdout, result.stderr, log),
-      entry: entryRel,
-    });
-  }
-
-  const pdf = await fs.readFile(pdfPath);
-  if (await getProjectFingerprint(root) === compileOutput.fingerprint) {
-    compileCache.set(req.params.project, {
-      entry: entryRel,
-      fingerprint: compileOutput.fingerprint,
-      pdf,
-    });
-  }
-  res.set('Content-Type', 'application/pdf');
-  res.set('X-Compiled-Entry', entryRel);
-  return res.status(200).send(pdf);
-});
+  return job;
+}
 
 async function withCompileLock(projectName, operation) {
   const previous = compileLocks.get(projectName) || Promise.resolve();
@@ -684,8 +794,10 @@ async function dirSizeBytes(dirAbsPath, stopAfter) {
   return total;
 }
 
-// tectonic process runner (unchanged behavior from the single-file MVP)
-function runTectonic(args, cwd) {
+// tectonic process runner, with an optional onChunk callback used to stream
+// stdout/stderr live to any connected SSE clients as the process runs (see
+// beginCompileJob above).
+function runTectonicStream(args, cwd, onChunk = null) {
   return new Promise((resolve, reject) => {
     const child = spawn('tectonic', args, {
       cwd,
@@ -711,8 +823,14 @@ function runTectonic(args, cwd) {
       }
     }, COMPILE_TIMEOUT_MS);
 
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      if (onChunk) onChunk(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+      if (onChunk) onChunk(chunk);
+    });
 
     child.on('error', (err) => {
       if (settled) return;
