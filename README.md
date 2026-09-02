@@ -7,7 +7,8 @@ This is **Phase 1**: an anonymous collaborative editor with a working compile pi
 * Multi-file **projects**, each with its own folder on disk under `projects/`
 * File tree on the left you can browse, open, and edit (CodeMirror), alongside a project picker and "+ New Project" / "+ New File" / "+ New Folder"
 * Selectable PDF preview in the browser's native PDF viewer on the right
-* Anonymous real-time editing for users in the same project
+* Real-time file sync for users in the same project, with live cursor/presence updates
+* Project-scoped `Shared undo history` toggle (default off): live editing stays on for everyone, but each collaborator's Ctrl/Cmd+Z only undoes their own edits unless the project explicitly opts into shared undo history
 * Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/) — compiles the whole project (so `\input`, `\include`, and other in-project references resolve correctly), not just a single file
 * Compile errors shown in a log panel
 * Each compile runs against a throwaway copy of the project in its own temporary directory, with a timeout
@@ -212,6 +213,30 @@ projects/
 * **Compile** always builds `main.tex` if one exists at the project's top level, otherwise the first `.tex` file it finds there. There's no per-file "set as main" yet, see Roadmap.
 * You can also add files to a project directly on disk (drag a folder into `projects/your-project/`), the tree picks up anything there on next load, no restart needed.
 
+## Project settings and shared undo history
+
+Each project has a persisted settings file named `.longtex.json` at the project root. It is created automatically if it does not already exist.
+
+```json
+{
+  "allowSharedClipboard": false
+}
+```
+
+The field name is intentionally kept as `allowSharedClipboard` for compatibility with older configuration and tests, but the UI label is now shown as "Shared Clipboard".
+
+The default is `false`:
+
+* live collaboration remains enabled for all users in the project
+* each user keeps their own Ctrl/Cmd+Z history private to their own edits
+
+When `allowSharedClipboard` is set to `true`:
+
+* collaborators can undo each other's edits with the same undo/redo stack behavior that older versions exposed
+* the setting is synchronized across all open tabs for the same project immediately over a dedicated Yjs settings room, without a reload
+
+This means the project toggle is now a shared collaborative state, not a per-browser-only setting.
+
 ## First-run network note
 
 By default, if a document requires a package that is not already cached, Tectonic may try to download it during compilation.
@@ -316,6 +341,42 @@ Creates a new project, seeded with an empty `main.tex`.
 Request body: `{ "name": "your-project" }` and only letters, numbers, `-`, `_` are allowed as name for e.g. "test$&" is not allowed but "test_1-2" is allowed.
 
 `201` on success, `409` if the name is already taken.
+
+### `GET /api/projects/:project/settings`
+
+Returns the current project settings. The persisted file is `.longtex.json` in the project root.
+
+```json
+{
+  "settings": {
+    "allowSharedClipboard": false
+  }
+}
+```
+
+The field name is kept as `allowSharedClipboard` for backward compatibility, but the UI label is shown as `Shared Clipboard`.
+
+### `PATCH /api/projects/:project/settings`
+
+Updates the project settings. `allowSharedClipboard` is the only supported setting at the moment.
+
+Request body:
+
+```json
+{ "allowSharedClipboard": true }
+```
+
+Response:
+
+```json
+{
+  "settings": {
+    "allowSharedClipboard": true
+  }
+}
+```
+
+When a settings room is active for the project, the server updates the shared Yjs map and fans the change out to all connected clients immediately; otherwise it falls back to writing the file directly.
 
 ### `GET /api/projects/:project/tree`
 
