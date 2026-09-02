@@ -20,6 +20,8 @@ const SERVER_INSTANCE_ID = crypto.randomBytes(8).toString('hex');
 const COMPILE_TIMEOUT_MS = 120_000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;        // cap for a single text file read/write
 const MAX_PROJECT_BYTES = 25 * 1024 * 1024;    // cap for total project size when compiling
+const PROJECT_SETTINGS_FILE = '.longtex.json';
+const DEFAULT_PROJECT_SETTINGS = Object.freeze({ allowSharedClipboard: false });
 
 // Where all projects live on disk. Each subdirectory is one project, shown
 // as-is in the UI file tree and compiled directly, so \input/\include work.
@@ -54,6 +56,46 @@ function roomKeyFor(projectName, filePath) {
   return `${projectName}::${filePath}`;
 }
 
+function settingsRoomKeyFor(projectName) {
+  return `${projectName}::__settings__`;
+}
+
+function normalizeProjectSettings(raw) {
+  const normalized = raw && typeof raw === 'object' ? raw : {};
+  return {
+    allowSharedClipboard: normalized.allowSharedClipboard === true,
+  };
+}
+
+async function readProjectSettings(projectName) {
+  const root = projectRootFor(projectName);
+  if (!root || !(await projectExists(root))) {
+    return { ...DEFAULT_PROJECT_SETTINGS };
+  }
+
+  const settingsPath = path.join(root, PROJECT_SETTINGS_FILE);
+  try {
+    const raw = await fs.readFile(settingsPath, 'utf8');
+    return normalizeProjectSettings(JSON.parse(raw));
+  } catch {
+    const defaultSettings = { ...DEFAULT_PROJECT_SETTINGS };
+    await fs.writeFile(settingsPath, `${JSON.stringify(defaultSettings, null, 2)}\n`, 'utf8');
+    return defaultSettings;
+  }
+}
+
+async function writeProjectSettings(projectName, nextSettings) {
+  const root = projectRootFor(projectName);
+  if (!root || !(await projectExists(root))) {
+    return { ...DEFAULT_PROJECT_SETTINGS };
+  }
+
+  const settings = normalizeProjectSettings(nextSettings);
+  const settingsPath = path.join(root, PROJECT_SETTINGS_FILE);
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+  return settings;
+}
+
 // How long to wait after the last edit before persisting a room to disk;
 // Yjs updates themselves are still sent to peers immediately, undebounced.
 const PERSIST_DEBOUNCE_MS = 500;
@@ -79,21 +121,69 @@ function schedulePersist(roomKey, projectName, filePath) {
   }, PERSIST_DEBOUNCE_MS));
 }
 
+function schedulePersistSettings(roomKey, projectName, settingsMap) {
+  clearTimeout(persistTimers.get(roomKey));
+  persistTimers.set(roomKey, setTimeout(async () => {
+    persistTimers.delete(roomKey);
+    const doc = yDocs.get(roomKey);
+    if (!doc || !settingsMap) return;
+    const root = projectRootFor(projectName);
+    if (!root || !(await projectExists(root))) return;
+    try {
+      const nextSettings = normalizeProjectSettings(Object.fromEntries(settingsMap.entries()));
+      await writeProjectSettings(projectName, nextSettings);
+    } catch {
+      // The next update (or an explicit settings write) will retry.
+    }
+  }, PERSIST_DEBOUNCE_MS));
+}
+
 server.on('upgrade', (request, socket, head) => {
   let projectName;
   let filePath;
+  let isSettingsRoom = false;
   try {
     const requestUrl = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
-    const match = requestUrl.pathname.match(/^\/collaboration\/([^/]+)\/([^/]+)$/);
-    projectName = match && decodeURIComponent(match[1]);
-    filePath = match && decodeURIComponent(match[2]);
+    const settingsMatch = requestUrl.pathname.match(/^\/collaboration\/([^/]+)\/__settings__$/);
+    const fileMatch = requestUrl.pathname.match(/^\/collaboration\/([^/]+)\/([^/]+)$/);
+
+    if (settingsMatch) {
+      isSettingsRoom = true;
+      projectName = settingsMatch && decodeURIComponent(settingsMatch[1]);
+    } else {
+      projectName = fileMatch && decodeURIComponent(fileMatch[1]);
+      filePath = fileMatch && decodeURIComponent(fileMatch[2]);
+    }
   } catch {
     projectName = null;
     filePath = null;
+    isSettingsRoom = false;
   }
 
   const root = projectRootFor(projectName);
-  if (!root || !filePath || !isTextEditable(filePath) || !resolveSafePath(root, filePath)) {
+  if (!root) {
+    socket.destroy();
+    return;
+  }
+
+  if (isSettingsRoom) {
+    projectExists(root)
+      .then((exists) => {
+        if (!exists) {
+          socket.destroy();
+          return;
+        }
+        collaborationServer.handleUpgrade(request, socket, head, (client) => {
+          collaborationServer.emit('connection', client, request, { projectName, filePath: null, isSettingsRoom: true });
+        });
+      })
+      .catch(() => {
+        socket.destroy();
+      });
+    return;
+  }
+
+  if (!filePath || !isTextEditable(filePath) || !resolveSafePath(root, filePath)) {
     socket.destroy();
     return;
   }
@@ -103,14 +193,31 @@ server.on('upgrade', (request, socket, head) => {
   });
 });
 
-collaborationServer.on('connection', (client, request, { projectName, filePath }) => {
-  const roomKey = roomKeyFor(projectName, filePath);
+collaborationServer.on('connection', (client, request, { projectName, filePath, isSettingsRoom = false }) => {
+  const roomKey = isSettingsRoom ? settingsRoomKeyFor(projectName) : roomKeyFor(projectName, filePath);
   const isNewRoom = !yDocs.has(roomKey);
   // getYDoc creates/registers the doc synchronously, so a concurrent second
   // connection to the same new room sees isNewRoom === false and skips reseeding.
   const doc = getYDoc(roomKey);
 
-  if (isNewRoom) {
+  if (isSettingsRoom) {
+    if (isNewRoom) {
+      const settingsMap = doc.getMap('settings');
+      readProjectSettings(projectName)
+        .then((initial) => {
+          const nextSettings = normalizeProjectSettings(initial);
+          doc.transact(() => {
+            for (const [key, value] of Object.entries(nextSettings)) {
+              settingsMap.set(key, value);
+            }
+          });
+          doc.on('update', () => schedulePersistSettings(roomKey, projectName, settingsMap));
+        })
+        .catch(() => {
+          doc.on('update', () => schedulePersistSettings(roomKey, projectName, doc.getMap('settings')));
+        });
+    }
+  } else if (isNewRoom) {
     // Seed the Y.Text from disk once, at room creation (not every connection).
     // Must be synchronous, before setupWSConnection attaches its listener below,
     // or an early client sync message could arrive and be dropped.
@@ -306,6 +413,7 @@ left, hit Compile, and both are included in the build.
 `,
     'utf8'
   );
+  await writeProjectSettings('demo', DEFAULT_PROJECT_SETTINGS);
 }
 
 // Path safety helpers
@@ -356,6 +464,46 @@ app.get('/api/projects', async (req, res) => {
   }
 });
 
+app.get('/api/projects/:project/settings', async (req, res) => {
+  const projectName = req.params.project;
+  const root = projectRootFor(projectName);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+
+  const settings = await readProjectSettings(projectName);
+  res.json({ settings });
+});
+
+app.patch('/api/projects/:project/settings', async (req, res) => {
+  const projectName = req.params.project;
+  const root = projectRootFor(projectName);
+  if (!root || !(await projectExists(root))) {
+    return res.status(404).json({ error: 'Project not found.' });
+  }
+
+  const settingsDoc = yDocs.get(settingsRoomKeyFor(projectName));
+  if (settingsDoc) {
+    const settingsMap = settingsDoc.getMap('settings');
+    const nextSettings = normalizeProjectSettings(req.body || {});
+    settingsDoc.transact(() => {
+      for (const [key, value] of Object.entries(nextSettings)) {
+        settingsMap.set(key, value);
+      }
+      for (const key of Array.from(settingsMap.keys())) {
+        if (!(key in nextSettings)) {
+          settingsMap.delete(key);
+        }
+      }
+    });
+    const settings = normalizeProjectSettings(Object.fromEntries(settingsMap.entries()));
+    return res.json({ settings });
+  }
+
+  const settings = await writeProjectSettings(projectName, req.body || {});
+  res.json({ settings });
+});
+
 // POST /api/projects -> create a new, empty (seeded) project
 // Body: { name: string }
 app.post('/api/projects', async (req, res) => {
@@ -374,6 +522,7 @@ app.post('/api/projects', async (req, res) => {
       '\\documentclass{article}\n\\begin{document}\n\n\\end{document}\n',
       'utf8'
     );
+    await writeProjectSettings(name, DEFAULT_PROJECT_SETTINGS);
     res.status(201).json({ name });
   } catch (err) {
     res.status(500).json({ error: `Could not create project: ${err.message}` });
@@ -864,12 +1013,18 @@ function combineLog(stdout, stderr, texLog) {
   return parts.join('\n\n') || '(no output captured)';
 }
 
-ensureProjectsRoot()
-  .catch((err) => {
-    console.error('Failed to set up projects/ directory:', err.message);
-  })
-  .finally(() => {
-    server.listen(PORT, () => {
-      console.log(`latex-cowrite listening on http://localhost:${PORT}`);
+if (require.main === module) {
+  ensureProjectsRoot()
+    .catch((err) => {
+      console.error('Failed to set up projects/ directory:', err.message);
+    })
+    .finally(() => {
+      server.listen(PORT, () => {
+        console.log(`latex-cowrite listening on http://localhost:${PORT}`);
+      });
     });
-  });
+}
+
+module.exports = {
+  normalizeProjectSettings,
+};

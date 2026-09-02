@@ -2,6 +2,7 @@
 
 // DOM refs
 const projectSelect = document.getElementById('project-select');
+const projectClipboardToggle = document.getElementById('project-clipboard-toggle');
 const newProjectBtn = document.getElementById('new-project-btn');
 const treeContainer = document.getElementById('tree-container');
 const newFileBtn = document.getElementById('new-file-btn');
@@ -132,6 +133,7 @@ const cm = CodeMirror.fromTextArea(document.getElementById('source'), {
 
 // State
 let currentProject = null;
+let currentProjectSettings = { allowSharedClipboard: false };
 let currentFile = null; // { path, editable }
 let expandedFolders = new Set();
 let dirty = false;
@@ -154,6 +156,10 @@ const collaboratorLabel = Math.random().toString(36).slice(2, 8);
 let currentYDoc = null;
 let currentProvider = null;
 let currentBinding = null;
+let currentUndoManager = null;
+let settingsYDoc = null;
+let settingsProvider = null;
+let settingsMap = null;
 // The server's per-process ID (GET /api/server-instance-id), checked before
 // letting a dropped connection auto-reconnect so a restart can be told apart
 // from a brief blip before Yjs re-syncs. null means not yet checked.
@@ -171,6 +177,10 @@ function teardownCollaboration() {
     currentBinding.destroy();
     currentBinding = null;
   }
+  if (currentUndoManager) {
+    currentUndoManager.destroy();
+    currentUndoManager = null;
+  }
   if (currentProvider) {
     currentProvider.destroy(); // also closes the underlying WebSocket
     currentProvider = null;
@@ -179,6 +189,50 @@ function teardownCollaboration() {
     currentYDoc.destroy();
     currentYDoc = null;
   }
+}
+
+function teardownProjectSettingsSync() {
+  if (settingsProvider) {
+    settingsProvider.destroy();
+    settingsProvider = null;
+  }
+  if (settingsYDoc) {
+    settingsYDoc.destroy();
+    settingsYDoc = null;
+  }
+  settingsMap = null;
+}
+
+function normalizeClientSettings(map) {
+  return { allowSharedClipboard: map && map.get('allowSharedClipboard') === true };
+}
+
+function openProjectSettingsSync(projectName) {
+  teardownProjectSettingsSync();
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const baseUrl = `${protocol}//${location.host}/collaboration/${encodeURIComponent(projectName)}`;
+  settingsYDoc = new Y.Doc();
+  settingsProvider = new WebsocketProvider(baseUrl, '__settings__', settingsYDoc);
+  settingsMap = settingsYDoc.getMap('settings');
+
+  settingsMap.observe(() => {
+    currentProjectSettings = normalizeClientSettings(settingsMap);
+    if (projectClipboardToggle) {
+      projectClipboardToggle.checked = !!currentProjectSettings.allowSharedClipboard;
+    }
+    applySharedUndoMode();
+  });
+}
+
+function applySharedUndoMode() {
+  if (!currentUndoManager || !currentProvider) return;
+  if (currentProjectSettings.allowSharedClipboard) {
+    currentUndoManager.trackedOrigins.add(currentProvider);
+  } else {
+    currentUndoManager.trackedOrigins.delete(currentProvider);
+  }
+  currentUndoManager.clear();
 }
 
 // Opens/re-opens collaboration for a file: Y.Doc + WebsocketProvider on its
@@ -224,11 +278,15 @@ function openCollaboration(projectName, filePath) {
   });
 
   const ytext = currentYDoc.getText('content');
+  currentUndoManager = new Y.UndoManager(ytext, { trackedOrigins: new Set() });
   // The binding's constructor immediately calls cm.setValue() to sync the
   // editor; suppress dirty-tracking for that one programmatic call.
   suppressChangeEvents = true;
-  currentBinding = new CodemirrorBinding(ytext, cm, currentProvider.awareness);
+  currentBinding = new CodemirrorBinding(ytext, cm, currentProvider.awareness, {
+    yUndoManager: currentUndoManager,
+  });
   suppressChangeEvents = false;
+  applySharedUndoMode();
 }
 
 // Called after a provider disconnects, instead of letting it auto-reconnect
@@ -319,6 +377,26 @@ async function refreshTectonicStatus() {
   }
 }
 
+async function refreshProjectSettings() {
+  if (!currentProject) {
+    currentProjectSettings = { allowSharedClipboard: false };
+    if (projectClipboardToggle) projectClipboardToggle.checked = false;
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/settings`);
+    const data = await res.json();
+    currentProjectSettings = data && data.settings ? data.settings : { allowSharedClipboard: false };
+  } catch {
+    currentProjectSettings = { allowSharedClipboard: false };
+  }
+
+  if (projectClipboardToggle) {
+    projectClipboardToggle.checked = !!currentProjectSettings.allowSharedClipboard;
+  }
+}
+
 // Projects
 async function loadProjects(selectName) {
   const res = await fetch('/api/projects');
@@ -342,6 +420,7 @@ async function loadProjects(selectName) {
 
 async function switchProject(name) {
   teardownCollaboration();
+  teardownProjectSettingsSync();
   setCollaborationStatus('no file open', 'unknown');
   currentProject = name;
   currentFile = null;
@@ -352,10 +431,20 @@ async function switchProject(name) {
   cm.setValue('');
   suppressChangeEvents = false;
   cm.setOption('readOnly', true);
+  await refreshProjectSettings();
+  openProjectSettingsSync(name);
   await loadTree();
 }
 
 projectSelect.addEventListener('change', () => switchProject(projectSelect.value));
+if (projectClipboardToggle) {
+  projectClipboardToggle.addEventListener('change', () => {
+    if (!currentProject || !settingsYDoc || !settingsMap) return;
+    settingsYDoc.transact(() => {
+      settingsMap.set('allowSharedClipboard', projectClipboardToggle.checked);
+    });
+  });
+}
 
 newProjectBtn.addEventListener('click', async () => {
   const name = prompt('New project name (letters, numbers, - and _ only):');
