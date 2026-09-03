@@ -8,8 +8,10 @@ This is **Phase 1**: an anonymous collaborative editor with a working compile pi
 * File tree on the left you can browse, open, and edit (CodeMirror), alongside a project picker and "+ New Project" / "+ New File" / "+ New Folder"
 * Selectable PDF preview in the browser's native PDF viewer on the right
 * Real-time file sync for users in the same project, with live cursor/presence updates
+* Collaborator profile icons in the header: click a collaborator to follow their file, cursor, and scroll position across the project
+* Following ends when you left-click in the editor; scrolling and typing do not stop following
 * Project-scoped `Shared undo history` toggle (default off): live editing stays on for everyone, but each collaborator's Ctrl/Cmd+Z only undoes their own edits unless the project explicitly opts into shared undo history
-* Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/) — compiles the whole project (so `\input`, `\include`, and other in-project references resolve correctly), not just a single file
+* Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/), compiles the whole project (so `\input`, `\include`, and other in-project references resolve correctly), not just a single file
 * Compile errors shown in a log panel
 * Each compile runs against a throwaway copy of the project in its own temporary directory, with a timeout
 
@@ -208,10 +210,12 @@ projects/
 * A **demo** project is seeded automatically the first time you run the app, so the UI never opens empty.
 * Use the project dropdown in the header to switch between projects, and **+ Project** to create a new one (it's seeded with an empty `main.tex`).
 * The file tree on the left shows the whole folder layout for the active project. Click a file to open it; click a folder to expand/collapse it.
+* Collaborator profile icons appear in the header while others are connected to the project. Click a profile to follow that collaborator; your editor opens the same files and follows their cursor and scroll position. Left-click inside the editor to stop following.
 * **+ File** / **+ Folder** create a new entry at a path you type (e.g. `sections/results.tex` or `figures`), including any missing parent folders.
 * Only recognized text files are editable in the browser: `.tex .bib .cls .sty .txt .md .json .yml .yaml .log`. Anything else (images, existing PDFs, etc.) still shows in the tree so the layout is visible, but isn't opened as text.
 * **Compile** always builds `main.tex` if one exists at the project's top level, otherwise the first `.tex` file it finds there. There's no per-file "set as main" yet, see Roadmap.
 * You can also add files to a project directly on disk (drag a folder into `projects/your-project/`), the tree picks up anything there on next load, no restart needed.
+* When you switch files, a dirty active file is saved automatically. If saving fails, navigation is canceled so edits are not lost.
 
 ## Project settings and shared undo history
 
