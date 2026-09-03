@@ -47,6 +47,35 @@ header .tag {
   gap: 10px;
 }
 
+#collaborators {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.collaborator-profile {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 2px solid var(--collaborator-color, var(--border));
+  border-radius: 50%;
+  color: var(--collaborator-color, #374151);
+  background: #fff;
+  font-size: 15px;
+  line-height: 24px;
+  text-align: center;
+}
+.collaborator-profile:hover,
+.collaborator-profile:focus-visible {
+  background: color-mix(in srgb, var(--collaborator-color, #374151) 12%, #fff);
+}
+.collaborator-profile.current {
+  box-shadow: 0 0 0 1px #fff, 0 0 0 3px var(--collaborator-color, var(--border));
+}
+.collaborator-profile.following {
+  box-shadow: 0 0 0 1px #fff, 0 0 0 3px #111827;
+}
+
 #project-select {
   font-size: 13px;
   padding: 5px 8px;

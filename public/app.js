@@ -42,6 +42,7 @@ const treeResizer = document.getElementById('tree-resizer');
 const paneResizer = document.getElementById('pane-resizer');
 const logResizer = document.getElementById('log-resizer');
 const collaborationStatus = document.getElementById('collaboration-status');
+const collaboratorsEl = document.getElementById('collaborators');
 let pdfObjectUrl = null;
 let currentCompileJobId = null;
 let currentCompileStream = null;
@@ -276,9 +277,11 @@ const { Y, WebsocketProvider, CodemirrorBinding } = window.Collab;
 // Same palette the old server-assigned colors used, but now picked
 // client-side (deterministically from each tab's Yjs client ID).
 const COLLABORATOR_COLORS = ['#d6336c', '#1971c2', '#2f9e44', '#e67700', '#7048e8', '#0c8599', '#c2255c', '#5f3dc4'];
+const COLLABORATOR_ICONS = ['✦', '◆', '●', '▲', '■', '✚', '★', '⬢'];
 // A short, friendly label shown next to remote cursors -- purely cosmetic,
 // unrelated to the Yjs/websocket protocol itself.
 const collaboratorLabel = Math.random().toString(36).slice(2, 8);
+const collaboratorIcon = COLLABORATOR_ICONS[Math.floor(Math.random() * COLLABORATOR_ICONS.length)];
 
 // The live Yjs pieces for whatever file is open; torn down before the next
 // file/project opens so no WebsocketProvider connection leaks.
@@ -290,6 +293,10 @@ let settingsYDoc = null;
 let settingsProvider = null;
 let settingsMap = null;
 let settingsRefreshTimer = null;
+let projectAwareness = null;
+let followedCollaboratorId = null;
+let followedCollaboratorFile = null;
+let followOpenInProgress = false;
 // The server's per-process ID (GET /api/server-instance-id), checked before
 // letting a dropped connection auto-reconnect so a restart can be told apart
 // from a brief blip before Yjs re-syncs. null means not yet checked.
@@ -334,7 +341,97 @@ function teardownProjectSettingsSync() {
     settingsYDoc.destroy();
     settingsYDoc = null;
   }
+  projectAwareness = null;
+  followedCollaboratorId = null;
+  followedCollaboratorFile = null;
+  followOpenInProgress = false;
+  renderCollaborators();
   settingsMap = null;
+}
+
+function renderCollaborators() {
+  if (!collaboratorsEl) return;
+  collaboratorsEl.replaceChildren();
+  if (!projectAwareness) return;
+
+  const collaborators = [...projectAwareness.getStates().entries()]
+    .map(([clientId, state]) => ({ clientId, ...state }))
+    .filter(({ user }) => user && user.name && user.icon);
+  if (!collaborators.some(({ clientId }) => clientId === followedCollaboratorId)) {
+    followedCollaboratorId = null;
+  }
+  for (const collaborator of collaborators) {
+    const button = document.createElement('button');
+    const isCurrentUser = collaborator.clientId === settingsYDoc.clientID;
+    const isFollowed = collaborator.clientId === followedCollaboratorId;
+    const file = collaborator.file || '';
+    button.className = `collaborator-profile${isCurrentUser ? ' current' : ''}${isFollowed ? ' following' : ''}`;
+    button.type = 'button';
+    button.textContent = collaborator.user.icon;
+    button.style.setProperty('--collaborator-color', collaborator.user.color);
+    button.title = isCurrentUser
+      ? `${collaborator.user.name} (you)`
+      : file ? `Follow ${collaborator.user.name} in ${file}` : `Follow ${collaborator.user.name}`;
+    button.setAttribute('aria-label', button.title);
+    if (!isCurrentUser && file) {
+      button.addEventListener('click', () => {
+        followedCollaboratorId = collaborator.clientId;
+        renderCollaborators();
+        followCollaboratorFile(collaborator.clientId, file);
+      });
+    }
+    collaboratorsEl.appendChild(button);
+  }
+}
+
+function updateProjectPresence(filePath = null, scrollTop = 0) {
+  if (!projectAwareness) return;
+  projectAwareness.setLocalStateField('file', filePath);
+  projectAwareness.setLocalStateField('scrollTop', filePath ? scrollTop : null);
+}
+
+async function followCollaboratorFile(clientId, filePath) {
+  if (!filePath || followOpenInProgress) return;
+  followedCollaboratorFile = filePath;
+  followOpenInProgress = true;
+  try {
+    await openFile({
+      path: filePath,
+      editable: isTextEditableClientSide(filePath),
+      name: filePath.split('/').pop(),
+    });
+  } finally {
+    followOpenInProgress = false;
+    const state = projectAwareness && projectAwareness.getStates().get(clientId);
+    const latestFile = state && state.file;
+    if (state && latestFile === followedCollaboratorFile && Number.isFinite(state.scrollTop)
+      && currentFile && currentFile.path === latestFile) {
+      cm.scrollTo(null, state.scrollTop);
+    }
+    if (latestFile && latestFile !== followedCollaboratorFile) {
+      followCollaboratorFile(clientId, latestFile);
+    }
+  }
+}
+
+function handleProjectAwarenessChange() {
+  renderCollaborators();
+  if (!projectAwareness || !followedCollaboratorId || followOpenInProgress) return;
+  const state = projectAwareness.getStates().get(followedCollaboratorId);
+  if (state && state.file === followedCollaboratorFile && Number.isFinite(state.scrollTop)
+    && currentFile && currentFile.path === state.file) {
+    cm.scrollTo(null, state.scrollTop);
+  }
+  if (state && state.file && state.file !== followedCollaboratorFile) {
+    followCollaboratorFile(followedCollaboratorId, state.file);
+  }
+}
+
+function stopFollowingCollaborator() {
+  if (followedCollaboratorId === null) return;
+  followedCollaboratorId = null;
+  followedCollaboratorFile = null;
+  renderCollaborators();
 }
 
 function startProjectSettingsPolling() {
@@ -358,6 +455,14 @@ function openProjectSettingsSync(projectName) {
   settingsYDoc = new Y.Doc();
   settingsProvider = new WebsocketProvider(baseUrl, '__settings__', settingsYDoc);
   settingsMap = settingsYDoc.getMap('settings');
+  projectAwareness = settingsProvider.awareness;
+  projectAwareness.setLocalStateField('user', {
+    name: collaboratorLabel,
+    icon: collaboratorIcon,
+    color: COLLABORATOR_COLORS[settingsYDoc.clientID % COLLABORATOR_COLORS.length],
+  });
+  projectAwareness.on('change', handleProjectAwarenessChange);
+  renderCollaborators();
 
   settingsMap.observe(() => {
     currentProjectSettings = normalizeClientSettings(settingsMap);
@@ -503,6 +608,15 @@ cm.on('change', (instance, changeObj) => {
   if (currentFile && currentFile.editable) {
     setDirty(true);
   }
+});
+
+cm.getWrapperElement().addEventListener('click', (event) => {
+  if (event.button === 0) stopFollowingCollaborator();
+});
+
+cm.on('scroll', () => {
+  if (!currentFile || !currentFile.editable || !projectAwareness) return;
+  updateProjectPresence(currentFile.path, cm.getScrollInfo().top);
 });
 
 // tectonic status
@@ -839,12 +953,13 @@ function createTreeActionButton(text, label) {
 // Open / save file
 async function openFile(node) {
   if (dirty) {
-    const proceed = confirm(`Discard unsaved changes to "${currentFile.path}"?`);
-    if (!proceed) return;
+    const saved = await saveCurrentFile();
+    if (!saved) return;
   }
 
   if (!node.editable) {
     teardownCollaboration();
+    updateProjectPresence();
     setCollaborationStatus('not editable', 'unknown');
     currentFile = { path: node.path, editable: false };
     activeFileNameEl.textContent = `${node.path} (not editable)`;
@@ -867,6 +982,7 @@ async function openFile(node) {
   }
 
   currentFile = { path: node.path, editable: true };
+  updateProjectPresence(node.path);
   activeFileNameEl.textContent = node.path;
   // Tear down the previous file's binding before touching cm's content --
   // otherwise a stray setValue() gets pushed into its shared Y.Text.
@@ -879,6 +995,7 @@ async function openFile(node) {
   cm.setOption('readOnly', false);
   setDirty(false);
   openCollaboration(currentProject, node.path);
+  updateProjectPresence(node.path, cm.getScrollInfo().top);
   loadTree();
 }
 
@@ -960,6 +1077,7 @@ async function renameEntry(node) {
       : `${newPath}${currentFile.path.slice(node.path.length)}`;
     activeFileNameEl.textContent = currentFile.path;
     if (currentFile.editable) {
+      updateProjectPresence(currentFile.path, cm.getScrollInfo().top);
       // Room key is `${project}::${path}`, so rename needs a fresh connection
       // under the new path or this tab keeps talking to the orphaned room.
       openCollaboration(currentProject, currentFile.path);
