@@ -3,6 +3,21 @@
 // DOM refs
 const projectSelect = document.getElementById('project-select');
 const projectClipboardToggle = document.getElementById('project-clipboard-toggle');
+const projectSettingsBtn = document.getElementById('project-settings-btn');
+const settingsModal = document.getElementById('settings-modal');
+const settingsForm = document.getElementById('project-settings-form');
+const settingsTheme = document.getElementById('settings-theme');
+const settingsLineNumbers = document.getElementById('settings-line-numbers');
+const settingsLineWrapping = document.getElementById('settings-line-wrapping');
+const settingsTabSize = document.getElementById('settings-tab-size');
+const settingsDefaultTab = document.getElementById('settings-default-tab');
+const settingsRawBtn = document.getElementById('settings-raw-btn');
+const settingsRawPanel = document.getElementById('settings-raw-panel');
+const settingsRawJson = document.getElementById('settings-raw-json');
+const settingsRawCloseBtn = document.getElementById('settings-raw-close-btn');
+const settingsRawApplyBtn = document.getElementById('settings-raw-apply-btn');
+const settingsCloseBtn = document.getElementById('settings-close-btn');
+const settingsCancelBtn = document.getElementById('settings-cancel-btn');
 const newProjectBtn = document.getElementById('new-project-btn');
 const treeContainer = document.getElementById('tree-container');
 const newFileBtn = document.getElementById('new-file-btn');
@@ -131,9 +146,123 @@ const cm = CodeMirror.fromTextArea(document.getElementById('source'), {
   indentUnit: 2,
 });
 
+function ensureCodeMirrorThemeStylesheet(themeName) {
+  const normalized = typeof themeName === 'string' && themeName.trim() ? themeName.trim() : 'eclipse';
+  const existing = document.getElementById('codemirror-theme-stylesheet');
+  if (existing && existing.getAttribute('data-theme') === normalized) {
+    return;
+  }
+
+  const next = document.createElement('link');
+  next.id = 'codemirror-theme-stylesheet';
+  next.setAttribute('data-theme', normalized);
+  next.rel = 'stylesheet';
+  next.href = `https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/${normalized}.min.css`;
+
+  if (existing) {
+    existing.remove();
+  }
+  document.head.appendChild(next);
+}
+
+function applyProjectSettingsToEditor() {
+  const editorSettings = currentProjectSettings.editor || {};
+  const themeName = typeof editorSettings.theme === 'string' ? editorSettings.theme : 'eclipse';
+  ensureCodeMirrorThemeStylesheet(themeName);
+  cm.setOption('theme', themeName);
+  cm.setOption('lineNumbers', editorSettings.lineNumbers !== false);
+  cm.setOption('lineWrapping', editorSettings.lineWrapping !== false);
+  cm.setOption('tabSize', Number.isInteger(editorSettings.tabSize) && editorSettings.tabSize > 0 ? editorSettings.tabSize : 2);
+  cm.setOption('indentUnit', Number.isInteger(editorSettings.indentUnit) && editorSettings.indentUnit > 0 ? editorSettings.indentUnit : 2);
+}
+
+function normalizeProjectSettings(raw) {
+  const normalized = raw && typeof raw === 'object' ? raw : {};
+  const collaboration = normalized.collaboration && typeof normalized.collaboration === 'object' ? normalized.collaboration : {};
+  const editor = normalized.editor && typeof normalized.editor === 'object' ? normalized.editor : {};
+  const pdfViewer = normalized.pdfViewer && typeof normalized.pdfViewer === 'object' ? normalized.pdfViewer : {};
+
+  const legacyAllowSharedClipboard = normalized.allowSharedClipboard === true;
+  const allowSharedClipboard = typeof collaboration.allowSharedClipboard === 'boolean'
+    ? collaboration.allowSharedClipboard
+    : legacyAllowSharedClipboard;
+
+  const editorTheme = typeof editor.theme === 'string' ? editor.theme : 'eclipse';
+  const editorLineNumbers = editor.lineNumbers !== false;
+  const editorLineWrapping = editor.lineWrapping !== false;
+  const editorTabSize = Number.isInteger(editor.tabSize) && editor.tabSize > 0 ? editor.tabSize : 2;
+  const editorIndentUnit = Number.isInteger(editor.indentUnit) && editor.indentUnit > 0 ? editor.indentUnit : editorTabSize;
+
+  return {
+    collaboration: {
+      allowSharedClipboard: allowSharedClipboard === true,
+    },
+    editor: {
+      theme: editorTheme,
+      lineNumbers: editorLineNumbers,
+      lineWrapping: editorLineWrapping,
+      tabSize: editorTabSize,
+      indentUnit: editorIndentUnit,
+    },
+    pdfViewer: {
+      defaultTab: pdfViewer.defaultTab === 'log' ? 'log' : 'pdf',
+    },
+  };
+}
+
+function populateSettingsForm() {
+  if (!settingsTheme || !settingsLineNumbers || !settingsLineWrapping || !settingsTabSize || !settingsDefaultTab) return;
+  const editorSettings = currentProjectSettings.editor || {};
+  settingsTheme.value = typeof editorSettings.theme === 'string' ? editorSettings.theme : 'eclipse';
+  settingsLineNumbers.checked = editorSettings.lineNumbers !== false;
+  settingsLineWrapping.checked = editorSettings.lineWrapping !== false;
+  const tabSize = Number.isInteger(editorSettings.tabSize) && editorSettings.tabSize > 0 ? editorSettings.tabSize : 2;
+  settingsTabSize.value = String(tabSize);
+  const defaultTab = currentProjectSettings.pdfViewer && currentProjectSettings.pdfViewer.defaultTab === 'log' ? 'log' : 'pdf';
+  settingsDefaultTab.value = defaultTab;
+}
+
+function openSettingsModal() {
+  if (!currentProject) return;
+  populateSettingsForm();
+  settingsModal.classList.remove('hidden');
+  settingsModal.setAttribute('aria-hidden', 'false');
+}
+
+function closeSettingsModal() {
+  settingsModal.classList.add('hidden');
+  settingsModal.setAttribute('aria-hidden', 'true');
+  if (settingsRawPanel) settingsRawPanel.classList.add('hidden');
+  if (settingsForm) settingsForm.classList.remove('hidden');
+}
+
+function showSettingsRawEditor() {
+  if (!settingsRawPanel || !settingsRawJson || !settingsForm) return;
+  settingsRawJson.value = JSON.stringify(currentProjectSettings, null, 2);
+  settingsForm.classList.add('hidden');
+  settingsRawPanel.classList.remove('hidden');
+}
+
+function showSettingsFormEditor() {
+  if (!settingsRawPanel || !settingsForm) return;
+  settingsRawPanel.classList.add('hidden');
+  settingsForm.classList.remove('hidden');
+}
+
+function getAllowSharedClipboard(settings = currentProjectSettings) {
+  const collaboration = settings && settings.collaboration && typeof settings.collaboration === 'object'
+    ? settings.collaboration
+    : {};
+  return collaboration.allowSharedClipboard === true || settings.allowSharedClipboard === true;
+}
+
 // State
 let currentProject = null;
-let currentProjectSettings = { allowSharedClipboard: false };
+let currentProjectSettings = {
+  collaboration: { allowSharedClipboard: false },
+  editor: { theme: 'eclipse', lineNumbers: true, lineWrapping: true, tabSize: 2, indentUnit: 2 },
+  pdfViewer: { defaultTab: 'pdf' },
+};
 let currentFile = null; // { path, editable }
 let expandedFolders = new Set();
 let dirty = false;
@@ -160,6 +289,7 @@ let currentUndoManager = null;
 let settingsYDoc = null;
 let settingsProvider = null;
 let settingsMap = null;
+let settingsRefreshTimer = null;
 // The server's per-process ID (GET /api/server-instance-id), checked before
 // letting a dropped connection auto-reconnect so a restart can be told apart
 // from a brief blip before Yjs re-syncs. null means not yet checked.
@@ -192,6 +322,10 @@ function teardownCollaboration() {
 }
 
 function teardownProjectSettingsSync() {
+  if (settingsRefreshTimer) {
+    clearInterval(settingsRefreshTimer);
+    settingsRefreshTimer = null;
+  }
   if (settingsProvider) {
     settingsProvider.destroy();
     settingsProvider = null;
@@ -203,8 +337,17 @@ function teardownProjectSettingsSync() {
   settingsMap = null;
 }
 
+function startProjectSettingsPolling() {
+  if (!currentProject) return;
+  if (settingsRefreshTimer) clearInterval(settingsRefreshTimer);
+  settingsRefreshTimer = setInterval(() => {
+    refreshProjectSettings().catch(() => {});
+  }, 2000);
+}
+
 function normalizeClientSettings(map) {
-  return { allowSharedClipboard: map && map.get('allowSharedClipboard') === true };
+  const raw = map && typeof map === 'object' ? Object.fromEntries(map.entries()) : {};
+  return normalizeProjectSettings(raw);
 }
 
 function openProjectSettingsSync(projectName) {
@@ -219,15 +362,18 @@ function openProjectSettingsSync(projectName) {
   settingsMap.observe(() => {
     currentProjectSettings = normalizeClientSettings(settingsMap);
     if (projectClipboardToggle) {
-      projectClipboardToggle.checked = !!currentProjectSettings.allowSharedClipboard;
+      projectClipboardToggle.checked = getAllowSharedClipboard(currentProjectSettings);
     }
+    applyProjectSettingsToEditor();
     applySharedUndoMode();
   });
+
+  startProjectSettingsPolling();
 }
 
 function applySharedUndoMode() {
   if (!currentUndoManager || !currentProvider) return;
-  if (currentProjectSettings.allowSharedClipboard) {
+  if (getAllowSharedClipboard(currentProjectSettings)) {
     currentUndoManager.trackedOrigins.add(currentProvider);
   } else {
     currentUndoManager.trackedOrigins.delete(currentProvider);
@@ -379,22 +525,36 @@ async function refreshTectonicStatus() {
 
 async function refreshProjectSettings() {
   if (!currentProject) {
-    currentProjectSettings = { allowSharedClipboard: false };
+    currentProjectSettings = {
+      collaboration: { allowSharedClipboard: false },
+      editor: { theme: 'eclipse', lineNumbers: true, lineWrapping: true, tabSize: 2, indentUnit: 2 },
+      pdfViewer: { defaultTab: 'pdf' },
+    };
     if (projectClipboardToggle) projectClipboardToggle.checked = false;
+    applyProjectSettingsToEditor();
     return;
   }
 
   try {
     const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/settings`);
     const data = await res.json();
-    currentProjectSettings = data && data.settings ? data.settings : { allowSharedClipboard: false };
+    currentProjectSettings = data && data.settings ? normalizeProjectSettings(data.settings) : {
+      collaboration: { allowSharedClipboard: false },
+      editor: { theme: 'eclipse', lineNumbers: true, lineWrapping: true, tabSize: 2, indentUnit: 2 },
+      pdfViewer: { defaultTab: 'pdf' },
+    };
   } catch {
-    currentProjectSettings = { allowSharedClipboard: false };
+    currentProjectSettings = {
+      collaboration: { allowSharedClipboard: false },
+      editor: { theme: 'eclipse', lineNumbers: true, lineWrapping: true, tabSize: 2, indentUnit: 2 },
+      pdfViewer: { defaultTab: 'pdf' },
+    };
   }
 
   if (projectClipboardToggle) {
-    projectClipboardToggle.checked = !!currentProjectSettings.allowSharedClipboard;
+    projectClipboardToggle.checked = getAllowSharedClipboard(currentProjectSettings);
   }
+  applyProjectSettingsToEditor();
 }
 
 // Projects
@@ -440,9 +600,126 @@ projectSelect.addEventListener('change', () => switchProject(projectSelect.value
 if (projectClipboardToggle) {
   projectClipboardToggle.addEventListener('change', () => {
     if (!currentProject || !settingsYDoc || !settingsMap) return;
-    settingsYDoc.transact(() => {
-      settingsMap.set('allowSharedClipboard', projectClipboardToggle.checked);
+    const nextSettings = normalizeProjectSettings({
+      ...normalizeProjectSettings(currentProjectSettings),
+      collaboration: { allowSharedClipboard: projectClipboardToggle.checked },
     });
+    settingsYDoc.transact(() => {
+      for (const [key, value] of Object.entries(nextSettings)) {
+        settingsMap.set(key, value);
+      }
+    });
+  });
+}
+
+if (projectSettingsBtn) {
+  projectSettingsBtn.addEventListener('click', openSettingsModal);
+}
+
+if (settingsCloseBtn) {
+  settingsCloseBtn.addEventListener('click', closeSettingsModal);
+}
+
+if (settingsCancelBtn) {
+  settingsCancelBtn.addEventListener('click', closeSettingsModal);
+}
+
+if (settingsRawBtn) {
+  settingsRawBtn.addEventListener('click', showSettingsRawEditor);
+}
+
+if (settingsRawCloseBtn) {
+  settingsRawCloseBtn.addEventListener('click', showSettingsFormEditor);
+}
+
+if (settingsRawApplyBtn) {
+  settingsRawApplyBtn.addEventListener('click', async () => {
+    if (!currentProject || !settingsRawJson) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(settingsRawJson.value);
+    } catch {
+      alert('Invalid JSON. Please fix the syntax before applying the project settings.');
+      return;
+    }
+
+    const nextSettings = normalizeProjectSettings(parsed);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(nextSettings),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not apply project settings.');
+      }
+      currentProjectSettings = normalizeProjectSettings(data.settings || nextSettings);
+      if (projectClipboardToggle) {
+        projectClipboardToggle.checked = getAllowSharedClipboard(currentProjectSettings);
+      }
+      applyProjectSettingsToEditor();
+      applySharedUndoMode();
+      showSettingsFormEditor();
+      populateSettingsForm();
+    } catch (err) {
+      alert(err.message || 'Could not apply project settings.');
+    }
+  });
+}
+
+if (settingsModal) {
+  settingsModal.addEventListener('click', (event) => {
+    if (event.target && event.target.dataset && event.target.dataset.closeSettings === 'true') {
+      closeSettingsModal();
+    }
+  });
+}
+
+if (settingsForm) {
+  settingsForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!currentProject) return;
+
+    const nextSettings = normalizeProjectSettings({
+      ...currentProjectSettings,
+      collaboration: {
+        allowSharedClipboard: projectClipboardToggle ? projectClipboardToggle.checked : getAllowSharedClipboard(currentProjectSettings),
+      },
+      editor: {
+        ...currentProjectSettings.editor,
+        theme: settingsTheme.value,
+        lineNumbers: settingsLineNumbers.checked,
+        lineWrapping: settingsLineWrapping.checked,
+        tabSize: Number(settingsTabSize.value) || 2,
+        indentUnit: Number(settingsTabSize.value) || 2,
+      },
+      pdfViewer: {
+        ...currentProjectSettings.pdfViewer,
+        defaultTab: settingsDefaultTab.value === 'log' ? 'log' : 'pdf',
+      },
+    });
+
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(nextSettings),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not save settings.');
+      }
+      currentProjectSettings = normalizeProjectSettings(data.settings || nextSettings);
+      if (projectClipboardToggle) {
+        projectClipboardToggle.checked = getAllowSharedClipboard(currentProjectSettings);
+      }
+      applyProjectSettingsToEditor();
+      applySharedUndoMode();
+      closeSettingsModal();
+    } catch (err) {
+      alert(err.message || 'Could not save settings.');
+    }
   });
 }
 

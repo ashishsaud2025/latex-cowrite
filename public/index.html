@@ -7,7 +7,6 @@
 
 <!-- CodeMirror 5 for the source editor -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" />
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/eclipse.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
 
@@ -20,6 +19,7 @@
   <div class="header-actions">
     <select id="project-select" title="Active project"></select>
     <button id="new-project-btn" title="Create a new project">+ Project</button>
+    <button id="project-settings-btn" type="button" title="Project settings">Settings</button>
     <label class="project-toggle" title="Let collaborators in this project share their clipboard content. Off by default: each user's clipboard is private to their own changes.">
       <input id="project-clipboard-toggle" type="checkbox" />
       <span>Shared Clipboard</span>
@@ -30,6 +30,73 @@
     <button id="compile-btn">Compile</button>
   </div>
 </header>
+
+<div id="settings-modal" class="modal hidden" aria-hidden="true">
+  <div class="modal-backdrop" data-close-settings="true"></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-header">
+      <h2 id="settings-title">Project Settings</h2>
+      <button id="settings-close-btn" type="button" aria-label="Close settings">×</button>
+    </div>
+    <form id="project-settings-form">
+      <div class="settings-grid">
+        <label>
+          <span>Editor theme</span>
+          <select id="settings-theme">
+            <option value="eclipse">Eclipse</option>
+            <option value="dracula">Dracula</option>
+            <option value="monokai">Monokai</option>
+            <option value="material-darker">Material Darker</option>
+            <option value="solarized dark">Solarized Dark</option>
+            <option value="tomorrow-night-eighties">Tomorrow Night Eighties</option>
+          </select>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="settings-line-numbers" type="checkbox" />
+          <span>Show line numbers</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="settings-line-wrapping" type="checkbox" />
+          <span>Wrap long lines</span>
+        </label>
+
+        <label>
+          <span>Tab size</span>
+          <select id="settings-tab-size">
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="8">8</option>
+          </select>
+        </label>
+
+        <label>
+          <span>Default preview tab</span>
+          <select id="settings-default-tab">
+            <option value="pdf">PDF</option>
+            <option value="log">Logs</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="modal-actions">
+        <button id="settings-raw-btn" type="button" class="secondary-btn">Open raw JSON</button>
+        <button id="settings-cancel-btn" type="button" class="secondary-btn">Cancel</button>
+        <button id="settings-save-btn" type="submit">Save Settings</button>
+      </div>
+    </form>
+
+    <div id="settings-raw-panel" class="raw-panel hidden">
+      <label for="settings-raw-json">Raw project config</label>
+      <textarea id="settings-raw-json" spellcheck="false"></textarea>
+      <div class="modal-actions raw-actions">
+        <button id="settings-raw-close-btn" type="button" class="secondary-btn">Back to form</button>
+        <button id="settings-raw-apply-btn" type="button">Apply JSON</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <main>
   <section id="editor-pane">
