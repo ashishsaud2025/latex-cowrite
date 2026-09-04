@@ -1,0 +1,56 @@
+'use strict';
+
+// Central access to DOM elements. Kept in one place so the view layer stays
+// isolated from the logic in the other modules.
+function byId(id) {
+  return document.getElementById(id);
+}
+
+export const dom = {
+  projectSelect: byId('project-select'),
+  projectClipboardToggle: byId('project-clipboard-toggle'),
+  projectSettingsBtn: byId('project-settings-btn'),
+  settingsModal: byId('settings-modal'),
+  settingsForm: byId('project-settings-form'),
+  settingsTheme: byId('settings-theme'),
+  settingsLineNumbers: byId('settings-line-numbers'),
+  settingsLineWrapping: byId('settings-line-wrapping'),
+  settingsTabSize: byId('settings-tab-size'),
+  settingsDefaultTab: byId('settings-default-tab'),
+  settingsRawBtn: byId('settings-raw-btn'),
+  settingsRawPanel: byId('settings-raw-panel'),
+  settingsRawJson: byId('settings-raw-json'),
+  settingsRawCloseBtn: byId('settings-raw-close-btn'),
+  settingsRawApplyBtn: byId('settings-raw-apply-btn'),
+  settingsCloseBtn: byId('settings-close-btn'),
+  settingsCancelBtn: byId('settings-cancel-btn'),
+  newProjectBtn: byId('new-project-btn'),
+  treeContainer: byId('tree-container'),
+  newFileBtn: byId('new-file-btn'),
+  newFolderBtn: byId('new-folder-btn'),
+  activeFileNameEl: byId('active-file-name'),
+  dirtyIndicator: byId('dirty-indicator'),
+  saveBtn: byId('save-btn'),
+  compileBtn: byId('compile-btn'),
+  compileStateEl: byId('compile-state'),
+  toolbarEl: byId('preview-toolbar'),
+  pdfContainer: byId('pdf-container'),
+  logPanel: byId('log-panel'),
+  logContent: byId('log-content'),
+  logClose: byId('log-close'),
+  pdfTab: byId('pdf-tab'),
+  logTab: byId('log-tab'),
+  statusPill: byId('tectonic-status'),
+  editorPane: byId('editor-pane'),
+  previewPane: byId('preview-pane'),
+  treeSidebar: byId('tree-sidebar'),
+  treeResizer: byId('tree-resizer'),
+  paneResizer: byId('pane-resizer'),
+  logResizer: byId('log-resizer'),
+  collaborationStatus: byId('collaboration-status'),
+  collaboratorsEl: byId('collaborators'),
+  sourceTextarea: byId('source'),
+  pdfPlaceholder: byId('pdf-placeholder'),
+  pdfView: byId('pdf-view'),
+  logView: byId('log-view'),
+};
