@@ -6,13 +6,15 @@ This is **Phase 1**: an anonymous collaborative editor with a working compile pi
 
 * Multi-file **projects**, each with its own folder on disk under `projects/`
 * File tree on the left you can browse, open, and edit (CodeMirror), alongside a project picker and "+ New Project" / "+ New File" / "+ New Folder"
-* Selectable PDF preview in the browser's native PDF viewer on the right
+* PDF.js preview on the right with selectable text, clickable table-of-contents and internal cross-reference links
+* Select uniquely matching text in the PDF to open and position the corresponding source file in the editor; ambiguous short matches ask for more context
 * Real-time file sync for users in the same project, with live cursor/presence updates
 * Collaborator profile icons in the header: click a collaborator to follow their file, cursor, and scroll position across the project
 * Following ends when you left-click in the editor; scrolling and typing do not stop following
 * Project-scoped `Shared undo history` toggle (default off): live editing stays on for everyone, but each collaborator's Ctrl/Cmd+Z only undoes their own edits unless the project explicitly opts into shared undo history
 * Compile on click using [`tectonic`](https://tectonic-typesetting.github.io/), compiles the whole project (so `\input`, `\include`, and other in-project references resolve correctly), not just a single file
 * Compile errors shown in a log panel
+* The final compile log includes the total compilation time; generated SyncTeX data is retained for PDF/source navigation
 * Each compile runs against a throwaway copy of the project in its own temporary directory, with a timeout
 
 ## Step-by-step setup
@@ -290,7 +292,7 @@ keeping generated files outside the project directory. Builds for the same
 project are serialized so concurrent requests cannot corrupt that workspace.
 
 After each compile, generated artifacts are copied into that project's
-`outputs/` folder. This includes the PDF, log, auxiliary files, and other
+`outputs/` folder. This includes the PDF, log, SyncTeX data, auxiliary files, and other
 Tectonic intermediates. The `outputs/` folder is excluded from the compiler's
 source copy and is ignored by the repository's existing `projects/` rule.
 
@@ -310,6 +312,8 @@ The current implementation uses an asynchronous compile job with a 120-second
 hard execution timeout. The client calls `/api/projects/:project/compile/start`
 and receives a `jobId` immediately; it then polls `/status` and listens for log
 updates until the build finishes, after which the PDF is fetched from `/pdf`.
+Completed status responses include `durationMs`, and the final log ends with a
+human-readable `Total compilation time` summary.
 
 For faster drafting, keep expensive TikZ/PGFPlots figures and large image
 directories out of the document while working, and use a temporary lightweight
@@ -446,7 +450,8 @@ Returns the current job state and result metadata.
   "error": null,
   "log": "<tectonic compilation log>",
   "cached": false,
-  "hasPdf": true
+  "hasPdf": true,
+  "durationMs": 863.7081
 }
 ```
 
@@ -463,6 +468,12 @@ Returns the compiled PDF once the job has finished successfully.
 Content-Type: application/pdf
 X-Compiled-Entry: main.tex
 ```
+
+### `GET /api/projects/:project/compile/:jobId/synctex`
+
+Returns the generated gzip-compressed SyncTeX data for a completed compile.
+The browser uses this artifact together with the PDF.js preview for precise
+PDF/source navigation.
 
 On failure, the status endpoint returns an `error` payload along with the log and entry name.
 
