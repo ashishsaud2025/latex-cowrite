@@ -558,14 +558,69 @@ Uses the same thin colored line and name label as before.
   margin-top: 40px;
 }
 
-#pdf-container .pdf-viewer {
+#pdf-container .pdf-page {
+  position: relative;
+  flex: 0 0 auto;
+  margin-bottom: 20px;
+  background: #fff;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+}
+
+#pdf-container .pdf-canvas,
+#pdf-container .textLayer {
+  position: absolute;
+  inset: 0;
+}
+
+#pdf-container .pdf-canvas {
+  display: block;
+}
+
+#pdf-container .textLayer {
+  overflow: hidden;
+  line-height: 1;
+  opacity: 0.2;
+  user-select: text;
+}
+
+#pdf-container .textLayer span {
+  position: absolute;
+  color: transparent;
+  cursor: text;
+  white-space: pre;
+  transform-origin: 0 0;
+}
+
+#pdf-container .textLayer ::selection {
+  background: rgba(47, 95, 214, 0.35);
+}
+
+#pdf-container .textLayer .pdf-source-match {
+  color: rgba(47, 95, 214, 0.45);
+  background: rgba(255, 214, 10, 0.65);
+}
+
+#pdf-container .annotationLayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  pointer-events: none;
+}
+
+#pdf-container .annotationLayer section {
+  position: absolute;
+  pointer-events: auto;
+}
+
+#pdf-container .annotationLayer a {
   display: block;
   width: 100%;
   height: 100%;
-  min-height: 500px;
-  border: 0;
-  background: #fff;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+}
+
+#pdf-container .annotationLayer a:hover {
+  background: rgba(47, 95, 214, 0.12);
 }
 
 #log-view {

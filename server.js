@@ -6,6 +6,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs/promises');
 const fsSync = require('fs'); // used only to seed a new room's content synchronously, see below
+const zlib = require('zlib');
 const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
@@ -363,6 +364,7 @@ app.get('/api/projects/:project/compile/:jobId/status', (req, res) => {
     log: job.log || '',
     cached: !!job.cached,
     hasPdf: !!job.pdf,
+    durationMs: job.durationMs,
   });
 });
 
@@ -404,6 +406,18 @@ app.get('/api/projects/:project/compile/:jobId/pdf', async (req, res) => {
   if (job.entry) res.set('X-Compiled-Entry', job.entry);
   if (job.cached) res.set('X-Compile-Cached', 'true');
   return res.status(200).send(job.pdf);
+});
+
+app.get('/api/projects/:project/compile/:jobId/synctex', (req, res) => {
+  const job = compileJobs.get(req.params.jobId);
+  if (!job || job.projectName !== req.params.project) {
+    return res.status(404).json({ error: 'Compile job not found.' });
+  }
+  if (!job.synctex) {
+    return res.status(404).json({ error: 'SyncTeX data is not available.' });
+  }
+  res.set('Content-Type', 'application/gzip');
+  return res.status(200).send(job.synctex);
 });
 
 // Lets a client check over plain HTTP whether it's still talking to the same
@@ -751,6 +765,12 @@ function emitJobEvent(job, eventName, payload) {
 function finalizeCompileJob(job, status, payload = {}) {
   job.status = status;
   Object.assign(job, payload);
+  if (job.durationMs == null) {
+    job.durationMs = Number(process.hrtime.bigint() - job.startedAt) / 1e6;
+  }
+  if (job.log && !job.log.includes('Total compilation time:')) {
+    job.log = `${job.log.replace(/\s*$/, '')}\n\nTotal compilation time: ${formatCompileDuration(job.durationMs)}`;
+  }
   emitJobEvent(job, 'status', {
     status,
     entry: job.entry,
@@ -758,6 +778,7 @@ function finalizeCompileJob(job, status, payload = {}) {
     log: job.log || '',
     cached: !!job.cached,
     hasPdf: !!job.pdf,
+    durationMs: job.durationMs,
   });
   for (const response of [...job.clients]) {
     try {
@@ -780,14 +801,17 @@ async function beginCompileJob(projectName, entryRel) {
     fingerprint,
     status: 'running',
     log: '',
+    startedAt: process.hrtime.bigint(),
+    durationMs: null,
     clients: new Set(),
     cached: false,
   };
   compileJobs.set(job.id, job);
 
-  if (cached && cached.entry === entryRel && cached.fingerprint === fingerprint) {
+  if (cached && cached.entry === entryRel && cached.fingerprint === fingerprint && cached.synctex) {
     job.cached = true;
     job.pdf = cached.pdf;
+    job.synctex = cached.synctex;
     job.status = 'success';
     job.log = 'Using cached PDF.';
     finalizeCompileJob(job, 'success', { cached: true, pdf: cached.pdf, log: job.log });
@@ -807,6 +831,7 @@ async function beginCompileJob(projectName, entryRel) {
           '-o', tmpDir,
           '--keep-logs',
           '--keep-intermediates',
+          '--synctex',
           '--reruns', '1',
         ];
         if (ONLY_CACHED) args.push('--only-cached');
@@ -822,6 +847,7 @@ async function beginCompileJob(projectName, entryRel) {
         const log = await readIfExists(logPath);
         const combined = combineLog(result.stdout, result.stderr, log);
         const pdfPath = path.join(tmpDir, `${path.basename(entryRel, '.tex')}.pdf`);
+        const synctexPath = path.join(tmpDir, `${path.basename(entryRel, '.tex')}.synctex.gz`);
 
         try {
           await publishCompileArtifacts(tmpDir, root);
@@ -850,14 +876,17 @@ async function beginCompileJob(projectName, entryRel) {
         }
 
         const pdf = await fs.readFile(pdfPath);
+        const synctex = await fs.readFile(synctexPath).catch(() => null);
         if (await getProjectFingerprint(root) === job.fingerprint) {
           compileCache.set(projectName, {
             entry: entryRel,
             fingerprint: job.fingerprint,
             pdf,
+            synctex,
           });
         }
         job.pdf = pdf;
+        job.synctex = synctex;
         job.log = combined;
         finalizeCompileJob(job, 'success', { log: combined, cached: false, pdf });
       });
@@ -1048,6 +1077,11 @@ function combineLog(stdout, stderr, texLog) {
   if (stdout) parts.push('--- stdout ---\n' + stdout);
   if (stderr) parts.push('--- stderr ---\n' + stderr);
   return parts.join('\n\n') || '(no output captured)';
+}
+
+function formatCompileDuration(durationMs) {
+  if (durationMs < 1000) return `${Math.round(durationMs)} ms`;
+  return `${(durationMs / 1000).toFixed(2)} s`;
 }
 
 if (require.main === module) {
