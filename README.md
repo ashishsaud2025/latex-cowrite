@@ -160,10 +160,11 @@ npm install
 ### 5. Build the real-time collaboration bundle
 
 Real-time collaborative editing is powered by [Yjs](https://yjs.dev), which
-is published as ES modules meant for a bundler. Since the rest of this
-app's frontend intentionally has no build step (CodeMirror is loaded from a
-CDN `<script>` tag, and `app.js` is a plain script), only this piece gets
-pre-bundled, into `public/collab-bundle.js`:
+is published as ES modules meant for a bundler. The rest of the app's
+frontend uses native ES modules directly in the browser (loaded via
+`<script type="module">` in `public/index.html`, with source under
+`public/js/`), so only the Yjs pieces get pre-bundled, into
+`public/collab-bundle.js`:
 
 ```bash
 npm run build
